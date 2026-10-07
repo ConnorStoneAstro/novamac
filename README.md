@@ -1,2 +1,2 @@
-# novamac
+# Novamac
 Bayesian transient scene modelling pipeline
