@@ -50,7 +50,7 @@ def build_prior(
 
         # Prior on image positions (crtan, for image alignment)
         lp = lp - 0.5 * ap.backend.sum(
-            ((self.sky_batch_model.target.crtan - crtan0) / wcs_prior_width) ** 2
+            ((self.models.sky_batch_model.target.crtan - crtan0) / wcs_prior_width) ** 2
         )
 
         for p in range(P):
@@ -63,21 +63,21 @@ def build_prior(
                 ** 2
             )
 
-            # Prior on point source log fluxes
+            # Prior on point source log fluxes. Template images carry no point
+            # source (flux = allflux * 0), so take the log of `allflux` (always
+            # > 0) and mask with not_template. Using `flux` here would give
+            # log(0) * 0 = nan for every template image.
+            log_allflux = jnp.log(self.models[f"ps_batch_model_{p}"].model.flux.allflux.value)
             lp = lp - 0.5 * ap.backend.sum(
-                (
-                    (jnp.log(self.models[f"ps_batch_model_{p}"].model.flux.value) - log_flux0[p])
-                    * not_template
-                    / logflux_prior_width
-                )
-                ** 2
+                ((log_allflux - log_flux0[p]) / logflux_prior_width) ** 2 * not_template
             )
 
-        # PSF prior
-        lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.n.value - psf_n0) ** 2 / psf_n_prior_width**2 # fmt: skip
-        lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.Rd.value / psf_Rd0 - 1) ** 2 / psf_Rd_prior_width**2 # fmt: skip
-        lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.q.value - psf_q0) ** 2 / psf_q_prior_width**2 # fmt: skip
-        lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.PA.value - psf_PA0) ** 2 / psf_PA_prior_width**2 # fmt: skip
+        # PSF prior (the PSF params are per image, shape (N,), so sum over images)
+        psf = self.models.pixelated_batch_model.model.psf
+        lp = lp - 0.5 * ap.backend.sum((psf.n.value - psf_n0) ** 2) / psf_n_prior_width**2
+        lp = lp - 0.5 * ap.backend.sum((psf.Rd.value / psf_Rd0 - 1) ** 2) / psf_Rd_prior_width**2
+        lp = lp - 0.5 * ap.backend.sum((psf.q.value - psf_q0) ** 2) / psf_q_prior_width**2
+        lp = lp - 0.5 * ap.backend.sum((psf.PA.value - psf_PA0) ** 2) / psf_PA_prior_width**2
 
         # Prior on pixel fluxes
         log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value)
@@ -85,3 +85,5 @@ def build_prior(
         return lp
 
     model.log_prior = types.MethodType(log_prior, model)
+
+    return model
