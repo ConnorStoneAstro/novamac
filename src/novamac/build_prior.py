@@ -75,7 +75,7 @@ def build_prior(
 
         # PSF prior
         lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.n.value - psf_n0) ** 2 / psf_n_prior_width**2 # fmt: skip
-        lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.Rd.value - psf_Rd0) ** 2 / psf_Rd_prior_width**2 # fmt: skip
+        lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.Rd.value / psf_Rd0 - 1) ** 2 / psf_Rd_prior_width**2 # fmt: skip
         lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.q.value - psf_q0) ** 2 / psf_q_prior_width**2 # fmt: skip
         lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.PA.value - psf_PA0) ** 2 / psf_PA_prior_width**2 # fmt: skip
 
