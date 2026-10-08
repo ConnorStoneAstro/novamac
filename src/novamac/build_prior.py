@@ -32,6 +32,7 @@ def build_prior(
         in tangent plane coordinates, in arcseconds (float)
       - logflux_prior_width: The width of the Gaussian prior on the log of the pixel fluxes (float)
     """
+    # Collect prior configuration
     P = model.meta.shapes["P"]
     crtan0 = jnp.array(model.meta.crtan0)
     ps_center0 = jnp.array(model.meta.ps_center0)
@@ -46,10 +47,12 @@ def build_prior(
     @ap.param.forward
     def log_prior(self, beta=0.0):
         lp = 0.0
+
         # Prior on image positions (crtan, for image alignment)
         lp = lp - 0.5 * ap.backend.sum(
             ((self.sky_batch_model.target.crtan - crtan0) / wcs_prior_width) ** 2
         )
+
         for p in range(P):
             # Prior on point source positions
             lp = lp - 0.5 * ap.backend.sum(
@@ -59,6 +62,7 @@ def build_prior(
                 )
                 ** 2
             )
+
             # Prior on point source log fluxes
             lp = lp - 0.5 * ap.backend.sum(
                 (
@@ -68,11 +72,13 @@ def build_prior(
                 )
                 ** 2
             )
+
         # PSF prior
         lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.n.value - psf_n0) ** 2 / psf_n_prior_width**2 # fmt: skip
         lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.Rd.value - psf_Rd0) ** 2 / psf_Rd_prior_width**2 # fmt: skip
         lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.q.value - psf_q0) ** 2 / psf_q_prior_width**2 # fmt: skip
         lp = lp - 0.5 * (model.pixelated_batch_model.model.psf.PA.value - psf_PA0) ** 2 / psf_PA_prior_width**2 # fmt: skip
+
         # Prior on pixel fluxes
         log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value)
         lp = lp + host_prior.log_prob(log_pix, host_prior.sde.sigma(beta))
