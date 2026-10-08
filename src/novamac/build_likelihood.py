@@ -225,6 +225,10 @@ def build_likelihood(
     model.meta.shapes = {"N": N, "P": P}
     model.meta.band = band
     model.meta.is_template = is_template
+    model.meta.psf_n0 = psf_n
+    model.meta.psf_Rd0 = psf_Rd
+    model.meta.psf_q0 = psf_q
+    model.meta.psf_PA0 = psf_PA
     model.meta.crpix0 = crpix
     model.meta.crtan0 = crtan
     model.meta.crval0 = crval
