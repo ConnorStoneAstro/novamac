@@ -43,9 +43,29 @@ def build_prior(
     psf_PA0 = jnp.array(model.meta.psf_PA0)
     not_template = jnp.array(~model.meta.is_template)
     host_prior = load_prior(host_prior_loc)
+    # Keep the prior object and the widths reachable from the model, e.g. for
+    # a sampler that needs the sigma(t) schedule or wants to seed a mass
+    # matrix from the prior widths.
+    model.meta.host_prior = host_prior
+    model.meta.prior_widths = {
+        "wcs": wcs_prior_width,
+        "ps_position": ps_position_prior_width,
+        "logflux": logflux_prior_width,
+        "psf_n": psf_n_prior_width,
+        "psf_Rd": psf_Rd_prior_width,
+        "psf_q": psf_q_prior_width,
+        "psf_PA": psf_PA_prior_width,
+    }
 
     @ap.param.forward
-    def log_prior(self, beta=0.0):
+    def log_prior(self, t=0.0):
+        """
+        Unnormalized log prior. `t` in [0, 1] is the diffusion time of the
+        host-galaxy prior: the pixel prior is evaluated at noise level
+        sigma(t) of the VE schedule, so t=1 is the broadest (nearly Gaussian)
+        prior and t=0 the sharpest one the model was trained on. The Gaussian
+        priors on the other parameters do not depend on t.
+        """
         lp = 0.0
 
         # Prior on image positions (crtan, for image alignment)
@@ -81,7 +101,7 @@ def build_prior(
 
         # Prior on pixel fluxes
         log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value)
-        lp = lp + host_prior.log_prob(log_pix, host_prior.sde.sigma(beta))
+        lp = lp + host_prior.log_prob(log_pix, host_prior.sde.sigma(t))
         return lp
 
     model.log_prior = types.MethodType(log_prior, model)

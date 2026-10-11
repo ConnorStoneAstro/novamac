@@ -238,21 +238,35 @@ def build_likelihood(
     model.meta.sky_I0 = sky_I0
 
     @ap.param.forward
-    def log_likelihood(self, beta=0.0):
+    def log_likelihood(self, extra_var=0.0):
         """
-        Compute the negative log likelihood of the model wrt the target image in the appropriate window.
-        """
+        Gaussian log likelihood (up to a constant) of the model wrt the target
+        images, ignoring masked pixels.
 
+        `extra_var` is added to the per-pixel variance. It is either a scalar
+        or an array matching the flattened data, and is how an annealing
+        scheme broadens the likelihood (e.g. sigma_t^2 * diag(J J^T) for a
+        diffusion prior at noise level sigma_t).
+        """
         model = self().flatten("data")
         data = self.target[self.window]
-        weight = 1 / (data.flatten("variance") * (1 + 5 * beta))
+        variance = data.flatten("variance") + extra_var
         mask = data.flatten("mask")
         data = data.flatten("data")
-        ll = -0.5 * ap.backend.sum((data - model) ** 2 * weight * (~mask))
-
-        return ll
+        # where() rather than multiplying by ~mask so that masked pixels with
+        # zero or infinite variance cannot inject nan
+        chi2 = ap.backend.where(mask, 0.0, (data - model) ** 2 / variance)
+        return -0.5 * ap.backend.sum(chi2)
 
     model.log_likelihood = types.MethodType(log_likelihood, model)
+
+    @ap.param.forward
+    def model_image_flat(self):
+        """The model images flattened in the same order as `log_likelihood`
+        compares them to the data (used for Jacobian-vector products)."""
+        return self().flatten("data")
+
+    model.model_image_flat = types.MethodType(model_image_flat, model)
 
     # Print model
     # ----------------------------------------------------------------

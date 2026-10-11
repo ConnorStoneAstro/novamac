@@ -8,8 +8,11 @@ def build_posterior(model: "ap.Model"):
     its gradient functions. These are returned as JAX jitted functions, so their
     first use will be quite slow and then fast afterwards.
 
-    A `beta` parameter is used to control the annealing schedule with beta=0
-    indicating no annealing and beta=1 indicating maximum annealing.
+    `t` is the diffusion time of the host prior (0 = sharpest, 1 = broadest)
+    and `extra_var` is added to the data variance in the likelihood; together
+    they define an annealed posterior. Note the returned functions follow the
+    scipy-minimize convention (negative log posterior); a sampler that wants
+    the log density must negate them.
 
     Args:
       - model: The full constructed AstroPhot model, augmented with a prior
@@ -23,9 +26,9 @@ def build_posterior(model: "ap.Model"):
         gradient and log posterior density
     """
 
-    def neg_log_posterior_density(params, beta=0.0):
-        ll = model.log_likelihood(beta=beta, params=params)
-        lp = model.log_prior(beta=beta, params=params)
+    def neg_log_posterior_density(params, t=0.0, extra_var=0.0):
+        ll = model.log_likelihood(extra_var=extra_var, params=params)
+        lp = model.log_prior(t=t, params=params)
         return -(ll + lp)
 
     f = jax.jit(neg_log_posterior_density)
