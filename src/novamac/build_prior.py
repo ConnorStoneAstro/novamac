@@ -17,6 +17,7 @@ def build_prior(
     psf_Rd_prior_width: float = 0.2,
     psf_q_prior_width: float = 0.1,
     psf_PA_prior_width: float = 0.2,
+    scene_scale_prior_width: float = 3.0,
 ):
     """
     Taking a model generated with `build_likelihood_model` this will construct a
@@ -31,6 +32,9 @@ def build_prior(
       - ps_position_prior_width: The width of the Gaussian prior on the PS positions
         in tangent plane coordinates, in arcseconds (float)
       - logflux_prior_width: The width of the Gaussian prior on the log of the pixel fluxes (float)
+      - scene_scale_prior_width: The width (natural log) of the Gaussian prior on log of the
+        scene scale factor, centred on its initial value; broad (3 = a factor of 20 at one
+        sigma) so it acts as a soft log-uniform prior. None for no prior (improper flat in log).
     """
     # Collect prior configuration
     P = model.meta.shapes["P"]
@@ -55,7 +59,9 @@ def build_prior(
         "psf_Rd": psf_Rd_prior_width,
         "psf_q": psf_q_prior_width,
         "psf_PA": psf_PA_prior_width,
+        "scene_scale": scene_scale_prior_width,
     }
+    log_scene_scale0 = float(jnp.log(model.meta.scene_scale0))
 
     @ap.param.forward
     def log_prior(self, t=0.0):
@@ -99,7 +105,12 @@ def build_prior(
         lp = lp - 0.5 * ap.backend.sum((psf.q.value - psf_q0) ** 2) / psf_q_prior_width**2
         lp = lp - 0.5 * ap.backend.sum((psf.PA.value - psf_PA0) ** 2) / psf_PA_prior_width**2
 
-        # Prior on pixel fluxes
+        # Soft log-uniform prior on the scene scale factor
+        if scene_scale_prior_width is not None:
+            log_scale = jnp.log(self.models.pixelated_batch_model.model.scale.value)
+            lp = lp - 0.5 * ((log_scale - log_scene_scale0) / scene_scale_prior_width) ** 2
+
+        # Prior on pixel fluxes (in the prior's own units: the scene scale absorbs the rest)
         log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value)
         lp = lp + host_prior.log_prob(log_pix, host_prior.sde.sigma(t))
         return lp

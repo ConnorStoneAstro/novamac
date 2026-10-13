@@ -27,6 +27,7 @@ def build_likelihood(
     sky_I0: np.ndarray,  # (N,)
     pix_scale: float,  # ()
     pix_init: np.ndarray,  # (Hpix, Wpix)
+    scene_scale0: float = 1.0,  # ()
     zp: Union[float, np.ndarray] = 22.5,  # (N,)
     name: str = "model",
     print_graph: bool = False,
@@ -65,7 +66,12 @@ def build_likelihood(
     - ps_flux0: The initial flux of the point source(s). Values for template images will be ignored but must be provided (P, N)
     - sky_I0: The initial sky background for each image (N,)
     - pix_scale: The pixel scale of the pixelated model image in arcsec/pix
-    - pix_init: The initial values for the pixelated model fluxes (Hpix, Wpix)
+    - pix_init: The initial values for the pixelated model surface brightness (Hpix, Wpix), in
+      data flux units per arcsec^2 (i.e. scale * I, the brightness the model renders)
+    - scene_scale0: Initial value of the free scene scale factor. The model renders
+      scale * I, and I is initialised to pix_init / scene_scale0 so the initial model
+      is independent of this choice; the scale lets the prior (which acts on I) sit in
+      its own units while the data are in theirs. Sampled with a log prior (see build_prior).
     - zp: The photometric zeropoint for each image, default is 22.5 (N,)
     - name: The name of the model (str)
     - print_graph: Whether to print the model parameter directed acyclic graph to a PDF file (bool)
@@ -152,7 +158,7 @@ def build_likelihood(
         name="pixelated",
         model_type="pixelated model",
         center=ps_center0[0],
-        I=pix_init,
+        I=pix_init / scene_scale0,
         pixelscale=pix_scale,
         PA=0.0,
         target=batch_target.images[0],
@@ -161,7 +167,8 @@ def build_likelihood(
         psf=psf_model,
         jacobian_maxparams=32,
     )
-    pixelated_model.scale.to_static(1.0)
+    pixelated_model.scale.to_dynamic(scene_scale0)  # free overall scale of the scene
+    pixelated_model.scale.valid = (0.0, None)
     pixelated_model.I.valid = (0.0, None)
     pixelated_model.pixelscale.to_static()  # fix pixelated model pixelscale
     pixelated_model.PA.to_static()  # fix pixelated model PA
@@ -236,6 +243,7 @@ def build_likelihood(
     model.meta.ps_center0 = ps_center0
     model.meta.ps_flux0 = ps_flux0
     model.meta.sky_I0 = sky_I0
+    model.meta.scene_scale0 = scene_scale0
 
     @ap.param.forward
     def log_likelihood(self, extra_var=0.0):
