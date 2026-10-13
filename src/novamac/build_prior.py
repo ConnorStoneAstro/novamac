@@ -110,14 +110,9 @@ def build_prior(
             log_scale = jnp.log(self.models.pixelated_batch_model.model.scale.value)
             lp = lp - 0.5 * ((log_scale - log_scene_scale0) / scene_scale_prior_width) ** 2
 
-        # Prior on pixel fluxes, in the prior's own units (the scene scale
-        # absorbs the rest) and in the prior's own coordinate: to_x is the
-        # softened log the network was trained on, log(s * softplus(I / s)),
-        # which never drops below the sky level. A plain log(I) would send
-        # faint pixels far outside the training support, where the energy
-        # network extrapolates arbitrarily.
-        x_pix = host_prior.to_x(self.models.pixelated_batch_model.model.I.value)
-        lp = lp + host_prior.log_prob(x_pix, host_prior.sde.sigma(t))
+        # Prior on pixel fluxes (in the prior's own units: the scene scale absorbs the rest)
+        log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value)
+        lp = lp + host_prior.log_prob(log_pix, host_prior.sde.sigma(t))
         return lp
 
     model.log_prior = types.MethodType(log_prior, model)
