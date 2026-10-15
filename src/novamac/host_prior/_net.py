@@ -606,11 +606,8 @@ def energy_map(
 ) -> Float[Array, "c h w"]:
     """The per-pixel contributions whose sum is ``scalar_energy``.
 
-    Exposed for samplers that need energy *differences* to better than the
-    float32 resolution of the total: at small sigma the ``"dae"`` energy is
-    ~1e7 for a 128x128 scene (prefactor ~1e3 times ||h||^2 ~1e4), where
-    float32 resolves only ~1, while a Metropolis test needs ~0.01. Summing
-    per-pixel differences between two scenes keeps that precision.
+    Kept separate so that ``scalar_energy`` can subtract a per-pixel offset
+    before the sum (see there).
     """
     sigma = jnp.asarray(sigma)
     if form == "sum":
@@ -622,15 +619,24 @@ def energy_map(
 
 def scalar_energy(
     h: Float[Array, "c h w"], sigma: Float[Array, ""], form: str,
-    data_std: float,
+    data_std: float, pixel_offset=0.0,
 ) -> Float[Array, ""]:
     """Turn an NCSN++ output map into a scalar energy.
 
     Separated from the module so the two formulas can be checked against
     analytic cases without a network in the way -- which is how the ``"dae"``
     prefactor is pinned (see ``NCSNppEnergy``).
+
+    ``pixel_offset`` is subtracted from every pixel's contribution *before*
+    the sum: ``E = sum(map - pixel_offset)``. A sampler passes the typical
+    per-pixel energy at this sigma, so that the float32 total stays small
+    enough to resolve the O(1) differences a Metropolis test needs (the raw
+    "dae" total is ~1e7 at small sigma, where float32 resolves only ~1, and
+    subtracting after the sum would recover nothing). Any offset that
+    depends on sigma alone shifts every scene at that sigma by the same
+    constant, so ratios are unchanged.
     """
-    return jnp.sum(energy_map(h, sigma, form, data_std))
+    return jnp.sum(energy_map(h, sigma, form, data_std) - pixel_offset)
 
 
 class NCSNppEnergy(EnergyModel):
@@ -735,17 +741,12 @@ class NCSNppEnergy(EnergyModel):
         self.data_std = float(data_std)
 
     def __call__(
-        self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
+        self, x: Float[Array, "c h w"], sigma: Float[Array, ""],
+        pixel_offset=0.0,
     ) -> Float[Array, ""]:
         return scalar_energy(self.net(x, sigma), sigma,
-                             self.net.config.energy_form, self.data_std)
-
-    def energy_map(
-        self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
-    ) -> Float[Array, "c h w"]:
-        """Per-pixel contributions whose sum is ``self(x, sigma)``."""
-        return energy_map(self.net(x, sigma), sigma,
-                          self.net.config.energy_form, self.data_std)
+                             self.net.config.energy_form, self.data_std,
+                             pixel_offset)
 
     # -- interface ---------------------------------------------------------
 

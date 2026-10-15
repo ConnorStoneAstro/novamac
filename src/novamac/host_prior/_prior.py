@@ -172,13 +172,8 @@ def _score(model, x, sigma):
 
 
 @eqx.filter_jit
-def _energy(model, x, sigma):
-    return jax.vmap(lambda a, s: model(a, s))(x, sigma)
-
-
-@eqx.filter_jit
-def _energy_map(model, x, sigma):
-    return jax.vmap(lambda a, s: model.energy_map(a, s))(x, sigma)
+def _energy(model, x, sigma, pixel_offset):
+    return jax.vmap(lambda a, s: model(a, s, pixel_offset))(x, sigma)
 
 
 # -- the prior -------------------------------------------------------------
@@ -256,13 +251,17 @@ class Prior:
         return _score(self.model, batched,
                       self._sigmas(sigma, len(batched))).reshape(shape)
 
-    def energy(self, x, sigma: float | None = None):
+    def energy(self, x, sigma: float | None = None, pixel_offset=0.0):
         """``E(x, sigma)``, a scalar per scene, with ``score == -grad_x E``.
 
         **What HMC needs that a score model cannot give**: the accept/reject
         step is on the Hamiltonian, so it wants the potential and not only its
         gradient.  Up to an additive constant, which is pure gauge, ``-energy``
         is the unnormalised log density.
+
+        ``pixel_offset`` is subtracted from every pixel's contribution before
+        the sum (a function of sigma alone leaves all ratios unchanged); see
+        ``_net.scalar_energy`` for why a sampler wants that in float32.
         """
         if not self.is_energy:
             raise TypeError(
@@ -273,33 +272,19 @@ class Prior:
                 f"'ncsnpp_energy'."
             )
         batched, shape = self._as_batch(x)
-        e = _energy(self.model, batched, self._sigmas(sigma, len(batched)))
+        e = _energy(self.model, batched, self._sigmas(sigma, len(batched)),
+                    jnp.asarray(pixel_offset))
         return e[0] if len(shape) < 4 else e
 
-    def log_prob(self, x, sigma: float | None = None):
+    def log_prob(self, x, sigma: float | None = None, pixel_offset=0.0):
         """``-energy``: the unnormalised log density, up to a constant.
 
         Differences between scenes at the same sigma are meaningful; the
         absolute value is not -- the partition function is not available.
+        ``pixel_offset`` (a per-pixel energy level, a function of sigma
+        alone) is subtracted inside the sum, see ``energy``.
         """
-        return -self.energy(x, sigma)
-
-    def energy_map(self, x, sigma: float | None = None):
-        """Per-pixel contributions whose sum is ``energy``, same shape as ``x``.
-
-        For samplers that need energy differences between two scenes to
-        better than the float32 resolution of the total (see
-        ``_net.energy_map``): sum the per-pixel differences instead.
-        """
-        if not self.is_energy:
-            raise TypeError(f"{self.source} has no energy (see .energy)")
-        batched, shape = self._as_batch(x)
-        m = _energy_map(self.model, batched, self._sigmas(sigma, len(batched)))
-        return m.reshape(shape)
-
-    def log_prob_map(self, x, sigma: float | None = None):
-        """``-energy_map``: per-pixel log density contributions, same shape as ``x``."""
-        return -self.energy_map(x, sigma)
+        return -self.energy(x, sigma, pixel_offset)
 
     def sample(self, key, n: int = 1, n_steps: int = 256, heun: bool = True):
         """Draw ``n`` scenes on the prior's own grid, in the model's space."""
