@@ -63,15 +63,8 @@ def build_prior(
     }
     log_scene_scale0 = float(jnp.log(model.meta.scene_scale0))
 
-    @ap.param.forward
-    def log_prior(self, t=0.0):
-        """
-        Unnormalized log prior. `t` in [0, 1] is the diffusion time of the
-        host-galaxy prior: the pixel prior is evaluated at noise level
-        sigma(t) of the VE schedule, so t=1 is the broadest (nearly Gaussian)
-        prior and t=0 the sharpest one the model was trained on. The Gaussian
-        priors on the other parameters do not depend on t.
-        """
+    def _log_prior_terms(self, t):
+        """(scene_map, rest) inside a forward context; see log_prior_parts."""
         lp = 0.0
 
         # Prior on image positions (crtan, for image alignment)
@@ -112,9 +105,33 @@ def build_prior(
 
         # Prior on pixel fluxes (in the prior's own units: the scene scale absorbs the rest)
         log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value)
-        lp = lp + host_prior.log_prob(log_pix, host_prior.sde.sigma(t))
-        return lp
+        scene_map = host_prior.log_prob_map(log_pix, host_prior.sde.sigma(t))
+        return scene_map, lp
 
+    @ap.param.forward
+    def log_prior_parts(self, t=0.0):
+        """
+        (scene_map, rest): the per-pixel host-prior contributions (same shape
+        as the scene) and the sum of every other prior term, so that
+        log_prior = sum(scene_map) + rest. A sampler's Metropolis test should
+        difference the maps pixel by pixel before summing: at small sigma the
+        host prior's total is ~1e7 and float32 resolves it only to ~1.
+        """
+        return _log_prior_terms(self, t)
+
+    @ap.param.forward
+    def log_prior(self, t=0.0):
+        """
+        Unnormalized log prior. `t` in [0, 1] is the diffusion time of the
+        host-galaxy prior: the pixel prior is evaluated at noise level
+        sigma(t) of the VE schedule, so t=1 is the broadest (nearly Gaussian)
+        prior and t=0 the sharpest one the model was trained on. The Gaussian
+        priors on the other parameters do not depend on t.
+        """
+        scene_map, rest = _log_prior_terms(self, t)
+        return jnp.sum(scene_map) + rest
+
+    model.log_prior_parts = types.MethodType(log_prior_parts, model)
     model.log_prior = types.MethodType(log_prior, model)
 
     return model

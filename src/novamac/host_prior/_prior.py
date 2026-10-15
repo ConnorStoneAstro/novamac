@@ -176,6 +176,11 @@ def _energy(model, x, sigma):
     return jax.vmap(lambda a, s: model(a, s))(x, sigma)
 
 
+@eqx.filter_jit
+def _energy_map(model, x, sigma):
+    return jax.vmap(lambda a, s: model.energy_map(a, s))(x, sigma)
+
+
 # -- the prior -------------------------------------------------------------
 
 
@@ -278,6 +283,23 @@ class Prior:
         absolute value is not -- the partition function is not available.
         """
         return -self.energy(x, sigma)
+
+    def energy_map(self, x, sigma: float | None = None):
+        """Per-pixel contributions whose sum is ``energy``, same shape as ``x``.
+
+        For samplers that need energy differences between two scenes to
+        better than the float32 resolution of the total (see
+        ``_net.energy_map``): sum the per-pixel differences instead.
+        """
+        if not self.is_energy:
+            raise TypeError(f"{self.source} has no energy (see .energy)")
+        batched, shape = self._as_batch(x)
+        m = _energy_map(self.model, batched, self._sigmas(sigma, len(batched)))
+        return m.reshape(shape)
+
+    def log_prob_map(self, x, sigma: float | None = None):
+        """``-energy_map``: per-pixel log density contributions, same shape as ``x``."""
+        return -self.energy_map(x, sigma)
 
     def sample(self, key, n: int = 1, n_steps: int = 256, heun: bool = True):
         """Draw ``n`` scenes on the prior's own grid, in the model's space."""

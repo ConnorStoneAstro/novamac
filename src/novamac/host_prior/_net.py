@@ -600,6 +600,26 @@ class NCSNpp(eqx.Module):
         }
 
 
+def energy_map(
+    h: Float[Array, "c h w"], sigma: Float[Array, ""], form: str,
+    data_std: float,
+) -> Float[Array, "c h w"]:
+    """The per-pixel contributions whose sum is ``scalar_energy``.
+
+    Exposed for samplers that need energy *differences* to better than the
+    float32 resolution of the total: at small sigma the ``"dae"`` energy is
+    ~1e7 for a 128x128 scene (prefactor ~1e3 times ||h||^2 ~1e4), where
+    float32 resolves only ~1, while a Metropolis test needs ~0.01. Summing
+    per-pixel differences between two scenes keeps that precision.
+    """
+    sigma = jnp.asarray(sigma)
+    if form == "sum":
+        return h / sigma
+    if form == "dae":
+        return 0.5 * (data_std**2 + sigma**2) / sigma**2 * h**2
+    raise ValueError(f"energy_form must be 'sum' or 'dae', got {form!r}")
+
+
 def scalar_energy(
     h: Float[Array, "c h w"], sigma: Float[Array, ""], form: str,
     data_std: float,
@@ -610,12 +630,7 @@ def scalar_energy(
     analytic cases without a network in the way -- which is how the ``"dae"``
     prefactor is pinned (see ``NCSNppEnergy``).
     """
-    sigma = jnp.asarray(sigma)
-    if form == "sum":
-        return jnp.sum(h) / sigma
-    if form == "dae":
-        return 0.5 * (data_std**2 + sigma**2) / sigma**2 * jnp.sum(h**2)
-    raise ValueError(f"energy_form must be 'sum' or 'dae', got {form!r}")
+    return jnp.sum(energy_map(h, sigma, form, data_std))
 
 
 class NCSNppEnergy(EnergyModel):
@@ -724,6 +739,13 @@ class NCSNppEnergy(EnergyModel):
     ) -> Float[Array, ""]:
         return scalar_energy(self.net(x, sigma), sigma,
                              self.net.config.energy_form, self.data_std)
+
+    def energy_map(
+        self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
+    ) -> Float[Array, "c h w"]:
+        """Per-pixel contributions whose sum is ``self(x, sigma)``."""
+        return energy_map(self.net(x, sigma), sigma,
+                          self.net.config.energy_form, self.data_std)
 
     # -- interface ---------------------------------------------------------
 
