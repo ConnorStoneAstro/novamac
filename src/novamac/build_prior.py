@@ -18,6 +18,7 @@ def build_prior(
     psf_q_prior_width: float = 0.1,
     psf_PA_prior_width: float = 0.2,
     scene_scale_prior_width: float = 3.0,
+    prior_scene_factor: float = 1.0,
 ):
     """
     Taking a model generated with `build_likelihood_model` this will construct a
@@ -27,6 +28,10 @@ def build_prior(
     Args:
       - model: The full constructed AstroPhot model
       - host_prior_loc: The location of the host prior, a path to the checkpoint directory (str)
+      - prior_scene_factor: the host prior is evaluated at log(I) + log(prior_scene_factor),
+        i.e. it is shown a scene this many times brighter than the one the likelihood
+        renders (an experiment: brighter training objects come with flatter, simpler
+        surroundings). 1 means the prior sees the scene as it is (float)
       - wcs_prior_width: The width of the Gaussian prior on the WCS parameters
         in tangent plane coordinates, in arcseconds (float)
       - ps_position_prior_width: The width of the Gaussian prior on the PS positions
@@ -51,6 +56,8 @@ def build_prior(
     # a sampler that needs the sigma(t) schedule or wants to seed a mass
     # matrix from the prior widths.
     model.meta.host_prior = host_prior
+    model.meta.prior_scene_factor = float(prior_scene_factor)
+    log_prior_scene_factor = float(jnp.log(prior_scene_factor))
     model.meta.prior_widths = {
         "wcs": wcs_prior_width,
         "ps_position": ps_position_prior_width,
@@ -135,7 +142,8 @@ def build_prior(
         """
         lp = _nuisance_log_prior(self)
         # Prior on pixel fluxes (in the prior's own units: the scene scale absorbs the rest)
-        log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value)
+        # the prior sees the scene prior_scene_factor times brighter than the likelihood does
+        log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value) + log_prior_scene_factor
         sigma = host_prior.sde.sigma(t)
         offset_fn = getattr(self.meta, "prior_energy_offset", None)
         pixel_offset = offset_fn(sigma) if offset_fn is not None else 0.0
