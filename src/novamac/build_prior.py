@@ -63,22 +63,9 @@ def build_prior(
     }
     log_scene_scale0 = float(jnp.log(model.meta.scene_scale0))
 
-    @ap.param.forward
-    def log_prior(self, t=0.0):
-        """
-        Unnormalized log prior. `t` in [0, 1] is the diffusion time of the
-        host-galaxy prior: the pixel prior is evaluated at noise level
-        sigma(t) of the VE schedule, so t=1 is the broadest (nearly Gaussian)
-        prior and t=0 the sharpest one the model was trained on. The Gaussian
-        priors on the other parameters do not depend on t.
-
-        If `self.meta.prior_energy_offset` is set to a function of sigma, its
-        value is subtracted from every scene pixel's energy before the sum
-        (host_prior.log_prob's `pixel_offset`): a sampler sets it to the
-        typical per-pixel energy at each sigma so the float32 total stays
-        small enough to resolve Metropolis differences. A function of sigma
-        alone leaves every ratio at fixed t unchanged.
-        """
+    def _nuisance_log_prior(self):
+        """Every prior term except the host prior on the scene pixels (all
+        Gaussian, no network); see log_prior_nuisance."""
         lp = 0.0
 
         # Prior on image positions (crtan, for image alignment)
@@ -117,6 +104,36 @@ def build_prior(
             log_scale = jnp.log(self.models.pixelated_batch_model.model.scale.value)
             lp = lp - 0.5 * ((log_scale - log_scene_scale0) / scene_scale_prior_width) ** 2
 
+        return lp
+
+    @ap.param.forward
+    def log_prior_nuisance(self):
+        """
+        The prior on everything except the scene pixels: image alignment,
+        point source positions and log fluxes, PSF shape, scene scale. All
+        Gaussian and independent of t, and cheap (no network), so a sampler
+        can update these blocks with the scene held fixed without evaluating
+        the host prior.
+        """
+        return _nuisance_log_prior(self)
+
+    @ap.param.forward
+    def log_prior(self, t=0.0):
+        """
+        Unnormalized log prior. `t` in [0, 1] is the diffusion time of the
+        host-galaxy prior: the pixel prior is evaluated at noise level
+        sigma(t) of the VE schedule, so t=1 is the broadest (nearly Gaussian)
+        prior and t=0 the sharpest one the model was trained on. The Gaussian
+        priors on the other parameters do not depend on t.
+
+        If `self.meta.prior_energy_offset` is set to a function of sigma, its
+        value is subtracted from every scene pixel's energy before the sum
+        (host_prior.log_prob's `pixel_offset`): a sampler sets it to the
+        typical per-pixel energy at each sigma so the float32 total stays
+        small enough to resolve Metropolis differences. A function of sigma
+        alone leaves every ratio at fixed t unchanged.
+        """
+        lp = _nuisance_log_prior(self)
         # Prior on pixel fluxes (in the prior's own units: the scene scale absorbs the rest)
         log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value)
         sigma = host_prior.sde.sigma(t)
@@ -125,6 +142,7 @@ def build_prior(
         lp = lp + host_prior.log_prob(log_pix, sigma, pixel_offset)
         return lp
 
+    model.log_prior_nuisance = types.MethodType(log_prior_nuisance, model)
     model.log_prior = types.MethodType(log_prior, model)
 
     return model
