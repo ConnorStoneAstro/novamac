@@ -82,9 +82,13 @@ class NCSNppConfig:
     treedef to key its jit cache.
     """
 
+    # These must match the trainer's NCSNppConfig defaults, and a test there
+    # asserts they do: a field absent from a config.json falls back to them,
+    # and two different fallbacks would build two different models from one
+    # file.
     in_channels: int = 1
-    nf: int = 64
-    ch_mult: tuple[int, ...] = (1, 2, 2, 2)
+    nf: int = 32
+    ch_mult: tuple[int, ...] = (1, 2, 4, 4)
     num_blocks: int = 2
     activation: str = "silu"
     init_scale: float = 1e-2

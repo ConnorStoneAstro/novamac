@@ -52,13 +52,19 @@ class LogFluxTransform:
 
     softening: float
 
-    def soften(self, flux):
-        """``s * softplus(f / s)``: nJy in, nJy out.  The shape the model can
-        express; above ``s`` it is the identity."""
-        xp = _xp(flux)
-        return self.softening * _softplus(flux / self.softening, xp)
+    def soften(self, flux, floor=0.0):
+        """``floor + s * softplus((f - floor) / s)``: nJy in, nJy out.
 
-    def forward(self, flux):
+        ``floor`` is where the map bends over -- the flux the sky is carried
+        towards and never goes below -- and ``s`` is how sharp the bend is.
+        The training loader passes a *per stamp* floor, a multiple of that
+        cutout's own sky noise; ``floor = 0`` is the original one-parameter
+        softening exactly.
+        """
+        xp = _xp(flux)
+        return floor + self.softening * _softplus((flux - floor) / self.softening, xp)
+
+    def forward(self, flux, floor=0.0):
         """nJy -> the model's space.  Finite for every real input, negative sky
         included.
 
@@ -68,10 +74,13 @@ class LogFluxTransform:
         returns the exact limit instead.
         """
         xp = _xp(flux)
-        u = flux / self.softening
-        sp = _softplus(u, xp)
-        log_sp = xp.where(u < _LINEAR_BELOW, u, xp.log(xp.where(sp > 0, sp, 1.0)))
-        return log_sp + math.log(self.softening)
+        s = self.softening
+        u = (flux - floor) / s
+        val = self.soften(flux, floor)
+        limit = u + math.log(s)
+        degenerate = (xp.asarray(floor) == 0) & (u < _LINEAR_BELOW)
+        direct = (val > 0) & ~degenerate
+        return xp.where(direct, xp.log(xp.where(direct, val, 1.0)), limit)
 
     def inverse(self, x):
         """The model's space -> nJy: ``exp(x)``.  **What a forward model calls.**
@@ -84,7 +93,7 @@ class LogFluxTransform:
         """
         return _xp(x).exp(x)
 
-    def inverse_exact(self, x):
+    def inverse_exact(self, x, floor=0.0):
         """The true inverse of ``forward``: ``s * log(expm1(exp(x) / s))``.
 
         For recovering a measurement, negative sky included.  Agrees with
@@ -92,8 +101,11 @@ class LogFluxTransform:
         """
         xp = _xp(x)
         s = self.softening
-        cx = x - math.log(s)
-        v = xp.exp(cx)
+        zero_floor = xp.asarray(floor) == 0
+        v = xp.where(zero_floor, xp.exp(x - math.log(s)),
+                     (xp.exp(xp.where(zero_floor, 0.0, x)) - floor) / s)
+        cx = xp.where(zero_floor, x - math.log(s),
+                      xp.log(xp.where(v > 0, v, 1e-300)))
         # Three regimes.  Large v: expm1 would overflow and log(expm1(v)) == v.
         # Very negative cx: v underflows, expm1(v) ~ v, so log(expm1(v)) ~ cx.
         # In between the direct expression is fine.
@@ -101,15 +113,19 @@ class LogFluxTransform:
         small = cx < _LINEAR_BELOW
         mid = xp.where(big | small, 1.0, v)
         direct = xp.log(xp.expm1(mid))
-        return s * xp.where(big, v, xp.where(small, cx, direct))
+        return floor + s * xp.where(big, v, xp.where(small, cx, direct))
 
     def jacobian(self, x):
         """``df/dx`` for the model map, which is simply ``f`` itself."""
         return self.inverse(x)
 
+    def sky_level_at(self, floor=0.0):
+        """Where zero flux lands in ``x``: ``log(floor + s * log 2)``."""
+        return _xp(floor).log(floor + self.softening * math.log(2.0))
+
     @property
     def sky_level(self) -> float:
-        """Where zero flux lands in ``x``: ``log(s * log 2)``."""
+        """``sky_level_at(0)``: where the sky sits with no floor."""
         return math.log(self.softening * math.log(2.0))
 
 
@@ -251,7 +267,7 @@ class Prior:
         return _score(self.model, batched,
                       self._sigmas(sigma, len(batched))).reshape(shape)
 
-    def energy(self, x, sigma: float | None = None, pixel_offset=0.0):
+    def energy(self, x, sigma: float | None = None, pixel_offset: float = 0.0):
         """``E(x, sigma)``, a scalar per scene, with ``score == -grad_x E``.
 
         **What HMC needs that a score model cannot give**: the accept/reject
@@ -259,8 +275,8 @@ class Prior:
         gradient.  Up to an additive constant, which is pure gauge, ``-energy``
         is the unnormalised log density.
 
-        ``pixel_offset`` is subtracted from every pixel's contribution before
-        the sum (a function of sigma alone leaves all ratios unchanged); see
+        ``pixel_offset`` is subtracted from each pixel's contribution before
+        the sum (a function of sigma alone leaves every ratio unchanged); see
         ``_net.scalar_energy`` for why a sampler wants that in float32.
         """
         if not self.is_energy:
@@ -276,13 +292,13 @@ class Prior:
                     jnp.asarray(pixel_offset))
         return e[0] if len(shape) < 4 else e
 
-    def log_prob(self, x, sigma: float | None = None, pixel_offset=0.0):
+    def log_prob(self, x, sigma: float | None = None, pixel_offset: float = 0.0):
         """``-energy``: the unnormalised log density, up to a constant.
 
         Differences between scenes at the same sigma are meaningful; the
         absolute value is not -- the partition function is not available.
-        ``pixel_offset`` (a per-pixel energy level, a function of sigma
-        alone) is subtracted inside the sum, see ``energy``.
+        ``pixel_offset`` (a per-pixel energy level, a function of sigma alone)
+        is subtracted inside the sum, see ``energy``.
         """
         return -self.energy(x, sigma, pixel_offset)
 
@@ -320,6 +336,35 @@ class Prior:
             f"{self.transform.sky_level:.3f}",
             f"  energy available: {self.is_energy}",
         ])
+
+
+def _input_offset(tr_cfg: dict) -> float:
+    """The typical sky level in ``x``: ``log(c + s * log 2)``.
+
+    Subtracted from the scene before the first layer so the zeros the
+    convolutions pad with sit at the sky.  ``c`` is the *typical* sky floor --
+    the midpoint of the per-stamp draw times the pooled sky noise, which is
+    recovered as ``softening / softening_sigma`` rather than stored again.
+
+    **This must match ``Config.input_offset`` in the training package exactly.**
+    It is a static field on the module, so it is not restored by
+    deserialisation -- the skeleton's value is the one that gets used, and a
+    mismatch computes different scores from the same weights with nothing to
+    say so.  It silently did, once: the floor raised the sky from 1.24 to 3.10
+    and this copy was still returning the unfloored number.
+    ``tests/test_standalone.py`` compares the two loaders' scores for exactly
+    that reason.
+    """
+    s = float(tr_cfg["softening"])
+    if not s:
+        return 0.0
+    lo = float(tr_cfg.get("floor_sigma_lo") or 0.0)
+    hi = float(tr_cfg.get("floor_sigma_hi") or 0.0)
+    softening_sigma = float(tr_cfg.get("softening_sigma") or 0.0)
+    c = 0.0
+    if hi > 0 and softening_sigma > 0:
+        c = 0.5 * (lo + hi) * (s / softening_sigma)
+    return math.log(c + s * math.log(2.0))
 
 
 def load_prior(directory, which: str = "ema") -> Prior:
@@ -360,9 +405,7 @@ def load_prior(directory, which: str = "ema") -> Prior:
     transform = LogFluxTransform(softening=float(tr_cfg["softening"]))
     sde = VESDE(float(sde_cfg["sigma_min"]), float(sde_cfg["sigma_max"]),
                 float(sde_cfg.get("data_mean") or 0.0))
-    # The sky level in x, subtracted before the first layer so the zeros the
-    # convolutions pad with sit at the sky.  Derived, never stored twice.
-    input_offset = transform.sky_level
+    input_offset = _input_offset(tr_cfg)
     common = dict(sigma_min=sde.sigma_min, sigma_max=sde.sigma_max,
                   input_offset=input_offset, key=jax.random.key(0))
     if architecture == "ncsnpp":

@@ -606,8 +606,10 @@ def energy_map(
 ) -> Float[Array, "c h w"]:
     """The per-pixel contributions whose sum is ``scalar_energy``.
 
-    Kept separate so that ``scalar_energy`` can subtract a per-pixel offset
-    before the sum (see there).
+    Named to match ``ConvEnergyNet.energy_map``, and split out for the same two
+    reasons: it is the natural diagnostic -- where in the scene the energy is
+    coming from -- and it is where ``scalar_energy`` subtracts its offset, one
+    pixel at a time, before anything is added up.
     """
     sigma = jnp.asarray(sigma)
     if form == "sum":
@@ -619,7 +621,7 @@ def energy_map(
 
 def scalar_energy(
     h: Float[Array, "c h w"], sigma: Float[Array, ""], form: str,
-    data_std: float, pixel_offset=0.0,
+    data_std: float, pixel_offset: Float[Array, ""] | float = 0.0,
 ) -> Float[Array, ""]:
     """Turn an NCSN++ output map into a scalar energy.
 
@@ -627,14 +629,17 @@ def scalar_energy(
     analytic cases without a network in the way -- which is how the ``"dae"``
     prefactor is pinned (see ``NCSNppEnergy``).
 
-    ``pixel_offset`` is subtracted from every pixel's contribution *before*
-    the sum: ``E = sum(map - pixel_offset)``. A sampler passes the typical
-    per-pixel energy at this sigma, so that the float32 total stays small
-    enough to resolve the O(1) differences a Metropolis test needs (the raw
-    "dae" total is ~1e7 at small sigma, where float32 resolves only ~1, and
-    subtracting after the sum would recover nothing). Any offset that
-    depends on sigma alone shifts every scene at that sigma by the same
-    constant, so ratios are unchanged.
+    ``pixel_offset`` comes off every pixel's contribution *before* the sum:
+    ``E = sum(energy_map - pixel_offset)``.  A sampler passes the typical
+    per-pixel energy at this sigma, and gets back a total small enough for
+    float32 to resolve the O(1) differences a Metropolis test is made of --
+    the raw ``"dae"`` total runs to ~1e7 at small sigma, where float32 spacing
+    is already ~1, so the accept ratio is quantised to noise.  Subtracting
+    after the sum recovers none of that; the precision is lost in the adding.
+
+    Any offset that depends on sigma alone shifts every scene at that sigma by
+    the same constant, which is the gauge freedom an unnormalised energy
+    already has.  Differences, gradients and accept ratios are untouched.
     """
     return jnp.sum(energy_map(h, sigma, form, data_std) - pixel_offset)
 
@@ -742,7 +747,7 @@ class NCSNppEnergy(EnergyModel):
 
     def __call__(
         self, x: Float[Array, "c h w"], sigma: Float[Array, ""],
-        pixel_offset=0.0,
+        pixel_offset: Float[Array, ""] | float = 0.0,
     ) -> Float[Array, ""]:
         return scalar_energy(self.net(x, sigma), sigma,
                              self.net.config.energy_form, self.data_std,
