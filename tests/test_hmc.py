@@ -18,7 +18,9 @@ import pytest
 
 from novamac.hmc import (
     adapt_step_size,
+    fold_into_box,
     hutchinson_jj_diag,
+    make_broadening_fn,
     make_chunk_runner,
     make_gauss_newton_fn,
     make_linear_gibbs_fn,
@@ -212,3 +214,79 @@ def test_linear_gibbs_draws_from_the_conditional():
     draws = np.asarray(x_new, np.float64)
     assert np.allclose(draws.mean(0), post_mean, atol=4 / np.sqrt(C * post_prec) + 0.02)
     assert np.allclose(draws.var(0), 1 / post_prec, rtol=0.15)
+
+
+def test_fold_into_box_is_an_involution_with_momentum_parity():
+    bound = 1.0
+    mask = jnp.array([1.0, 1.0, 1.0, 1.0, 0.0])
+    x = jnp.array([0.2, 1.5, -2.2, 4.2, 7.0])  # inside; one wall; one wall the other way; two walls; not a scene coordinate
+    folded, flip = fold_into_box(x, bound, mask)
+    assert np.allclose(np.asarray(folded), [0.2, 0.5, 0.2, 0.2, 7.0])
+    assert np.asarray(flip).tolist() == [False, True, True, False, False]
+    # reversibility: the folded point with the flipped momentum retraces the move
+    x0, drift = 0.2, 4.0
+    y, flip_y = fold_into_box(jnp.array([x0 + drift]), bound, jnp.ones(1))
+    back, _ = fold_into_box(y - (-1.0 if flip_y[0] else 1.0) * drift, bound, jnp.ones(1))
+    assert np.isclose(float(back[0]), x0)
+    y, flip_y = fold_into_box(jnp.array([x0 + 1.3]), bound, jnp.ones(1))  # one wall: momentum flips
+    back, _ = fold_into_box(y - (-1.0 if flip_y[0] else 1.0) * 1.3, bound, jnp.ones(1))
+    assert np.isclose(float(back[0]), x0)
+    # an infinite bound is a no-op
+    same, flip_inf = fold_into_box(x, jnp.inf, mask)
+    assert np.allclose(np.asarray(same), np.asarray(x)) and not np.any(np.asarray(flip_inf))
+
+
+def test_broadening_is_zero_at_t0():
+    class SDE:
+        sigma_min, sigma_max = 0.01, 10.0
+
+    broaden = make_broadening_fn(SDE(), data_std=1.0)
+    assert float(broaden(0.0)) == 0.0
+    assert float(broaden(0.3)) > 0.0
+
+
+def test_linear_gibbs_ridge_term_keeps_the_weak_coordinate_exact():
+    """Precisions 1e6 and 1: the ridge (1e-6 x the mean diagonal) would
+    tighten the weak coordinate's proposal by a quarter; the acceptance
+    ratio carries the matching term, so the draws keep the exact variance."""
+    K = 2
+    a = jnp.asarray([1000.0, 1.0])
+    y = jnp.asarray([500.0, 0.7])
+    lin = {
+        "idx": np.arange(K), "group": np.arange(K), "image": np.arange(K), "is_log": np.zeros(K, bool),
+        "prior_mean": np.zeros(K), "prior_prec": np.zeros(K), "source": np.full(K, -1), "pix_image": np.arange(K), "n_images": K,
+    }  # fmt: skip
+    gibbs = make_linear_gibbs_fn(lambda x: a * x, y, jnp.ones(K), lambda t: 0.0 * t, lin, extra_jitter=1e-6)
+    C = 4000
+    key = jax.random.key(1)
+    x = jnp.zeros((C, K), jnp.float32)
+    for _ in range(40):
+        key, k = jax.random.split(key)
+        x, frac, _, _ = gibbs(jax.random.split(k, C), x, 0.0, jnp.zeros(K), jnp.ones(K))
+    draws = np.asarray(x, np.float64)
+    assert float(np.mean(np.asarray(frac))) > 0.5
+    assert abs(draws[:, 1].mean() - 0.7) < 0.08
+    assert abs(draws[:, 1].var() - 1.0) < 0.1
+
+
+def test_nuisance_step_trace_describes_the_returned_state(toy):
+    """With the non-scene sub-step on, the logged density must be that of the
+    state the step returns, after an accepted nuisance move."""
+    scene_mask = jnp.array([1.0, 1.0, 1.0, 1.0, 0.0])
+    pm, ps = toy["prior_mean"], toy["prior_sd"]
+    target = make_target(toy["log_lik"], toy["log_prior"], sigma_fn, scene_mask, tweedie=False)
+    nuisance_log_prior = lambda x: -0.5 * (x[4] - pm[4]) ** 2 / ps[4] ** 2  # the t = 0 prior of the nuisance coordinate  # noqa: E731
+    runner = make_chunk_runner(target, broaden_fn, sigma_fn, 3, 8, 0.0, 0.0, nuisance_log_prior=nuisance_log_prior, nuisance_steps=3)
+    C = 16
+    x0 = jnp.tile(jnp.asarray(pm) + 0.5, (C, 1))
+    jj = jnp.asarray(np.sum(toy["A"] ** 2, axis=1), jnp.float32)
+    zeros = jnp.zeros(8, jnp.float32)
+    x, tr = runner(jax.random.split(jax.random.key(3), C), x0, jnp.full(C, 0.05), jnp.full(C, 0.3), jnp.full(D, 0.05), zeros, zeros, jj,
+                   jnp.full(D, jnp.inf), scene_mask)  # fmt: skip
+    assert np.asarray(tr["accept_prob_nuis"]).mean() > 0.2
+    moved = ~np.isclose(np.asarray(x[:, 4]), float(pm[4] + 0.5))
+    assert moved.any(), "no nuisance move was accepted"
+    ev = broaden_fn(0.0) * jj  # the toy's own broadening (sigma_min^2 at t = 0), as the runner used it
+    lp_true = np.array([float(toy["log_lik"](x[c], ev) + toy["log_prior"](x[c], 0.0)) for c in range(C)])
+    assert np.allclose(np.asarray(tr["logdensity"])[:, -1], lp_true, rtol=1e-4, atol=1e-3)
+    assert np.allclose(np.asarray(tr["loglik"])[:, -1], [float(toy["log_lik"](x[c], ev)) for c in range(C)], rtol=1e-4, atol=1e-3)

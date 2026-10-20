@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from novamac import Novamac, build_likelihood
+from novamac.sampler import flat_data_weight
 from novamac.init_scene import (
     aperture_fluxes,
     border_sky,
@@ -189,7 +190,11 @@ def test_aperture_fluxes_recover_a_moffat():
         r = np.hypot(cols - ppix[i, 0], rows - ppix[i, 1])  # pixels
         profile = (n - 1) / (np.pi * Rd**2) * (1 + (r / Rd) ** 2) ** (-n)  # per pixel
         data[i] = flux_true[i] * profile + rng.normal(0, 0.05, (H, W))
-    flux, err = aperture_fluxes(data, np.full(data.shape, 400.0), np.zeros(data.shape, bool), crpix, crtan, CD, pos,
+    weight = np.full(data.shape, 400.0)
+    hot = (int(round(ppix[0, 1])) + 1, int(round(ppix[0, 0])))
+    data[0][hot] += 1e4  # a bad pixel inside the aperture ...
+    weight[0][hot] = 0.0  # ... that the likelihood ignores must not count
+    flux, err = aperture_fluxes(data, weight, np.zeros(data.shape, bool), crpix, crtan, CD, pos,
                                 np.full(N, n), np.full(N, Rd), radius_factor=1.5)  # fmt: skip
     assert np.allclose(flux[[0, 2]], flux_true[[0, 2]], rtol=0.08)
     assert abs(flux[1]) < 3 * err[1]
@@ -253,3 +258,13 @@ def test_settings_are_per_instance(prior_dir, synthetic):
     assert a.release_t["psf"] == 0.1 and a.release_t["sky"] == Novamac.release_t["sky"]
     assert b.release_t["psf"] == Novamac.release_t["psf"]
     assert "num_chains" in a.settings() and a.settings()["release_t"]["psf"] == 0.1
+
+
+def test_masked_nan_does_not_reach_the_flat_data(prior_dir, synthetic, tmp_path):
+    inputs, _ = synthetic
+    bad = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in inputs.items()}
+    bad["data"][2, 3, 3] = np.nan  # under the fixture's masked blob
+    assert bad["mask"][2, 3, 3]
+    nm = Novamac(prior=prior_dir, out_dir=tmp_path, verbose=False, **bad)
+    data, weight = flat_data_weight(nm.build_model())
+    assert np.all(np.isfinite(data)) and np.all(weight[~np.isfinite(bad["data"].ravel())] == 0)

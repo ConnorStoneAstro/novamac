@@ -152,7 +152,10 @@ def make_broadening_fn(sde, data_std=None):
     v -> sigma^2 at small sigma and saturates at s^2.
     """
     log_variance = make_log_variance_fn(sde, data_std)
-    return lambda t: jnp.expm1(jnp.minimum(log_variance(t), MAX_LOG_BROADENING))
+    # zero at t = 0: the hold samples the plain likelihood (the Tweedie shift
+    # and the mean correction switch off there too), not one broadened by
+    # the residual sigma_min noise
+    return lambda t: jnp.where(t > 0, jnp.expm1(jnp.minimum(log_variance(t), MAX_LOG_BROADENING)), 0.0)
 
 
 def make_log_variance_fn(sde, data_std=None):
@@ -386,6 +389,27 @@ def make_block_curvature_fn(target, broaden_fn, groups):
     return curvature
 
 
+# Reflecting box on the scene coordinates
+#####################################################################
+def fold_into_box(x, bound, scene_mask):
+    """
+    Fold the scene coordinates of x (scene_mask > 0) back into [-bound, bound]
+    by reflection at the walls, however many walls a jump crossed (a triangle
+    wave of period 4 * bound), so the map is its own inverse and the leapfrog
+    stays reversible. Also returns, per coordinate, whether an odd number of
+    walls was crossed, which is when the momentum must flip. No-op for an
+    infinite bound.
+    """
+    finite = jnp.isfinite(bound)
+    b = jnp.where(finite, bound, 1.0)
+    u = jnp.mod(x + b, 4.0 * b)
+    folded = jnp.where(u <= 2.0 * b, u - b, 3.0 * b - u)
+    crossings = jnp.floor((x + b) / (2.0 * b))
+    in_box = (scene_mask > 0) & finite
+    flip = in_box & (jnp.mod(crossings, 2.0) != 0)
+    return jnp.where(in_box, folded, x), flip
+
+
 # Predictor-corrector chunk
 #####################################################################
 def make_chunk_runner(
@@ -448,9 +472,10 @@ def make_chunk_runner(
     (None) one HMC moves every released coordinate, as before.
 
     max_abs_scene truncates the target to |x| <= max_abs_scene on the scene
-    coordinates: the leapfrog reflects at the box (bounce the coordinate,
-    flip its momentum, which keeps the integrator volume preserving and
-    reversible, so no rejections at the wall), the predictor reflects too,
+    coordinates: the leapfrog reflects at the box (fold the coordinate back
+    across however many walls it crossed, flip its momentum for an odd
+    number, which keeps the integrator volume preserving and reversible, so
+    no rejections at the wall; fold_into_box), the predictor reflects too,
     and the density is -inf outside as a backstop. The scene is stored as
     exp(x) in float32, which overflows at |x| ~ 88, so this keeps the chain
     on representable values when the noise level is large (sigma ~ 27 at
@@ -482,12 +507,9 @@ def make_chunk_runner(
             nuis_value_and_grad = jax.value_and_grad(_nuis_logp, has_aux=True)
 
         def reflect_scene(x):
-            # mirror scene coordinates back into the box (no-op when bound = inf);
-            # also returns which coordinates were reflected
-            out = (jnp.abs(x) > bound) & (scene_mask > 0)
-            x_ref = jnp.where(x > bound, 2.0 * bound - x, jnp.where(x < -bound, -2.0 * bound - x, x))
-            x_ref = jnp.clip(x_ref, -bound, bound)  # a jump of more than 2 * bound still lands inside
-            return jnp.where(out, x_ref, x), out
+            # scene coordinates folded back into the box (no-op when bound = inf);
+            # also returns which coordinates need their momentum flipped
+            return fold_into_box(x, bound, scene_mask)
 
         def predictor_step(key, x, t_prev, t):
             s_cur, s_new = sigma_fn(t_prev), sigma_fn(t)
@@ -550,7 +572,7 @@ def make_chunk_runner(
             ll = jnp.where(accept, aux1[0], aux0[0])
             lpr = jnp.where(accept, aux1[1], aux0[1])
             score = jnp.where(accept, aux1[2], aux0[2])
-            return x, (lp, ll, lpr, accept_prob, log_alpha, divergent), score
+            return x, (lp, ll, lpr, accept_prob, log_alpha, divergent), score, aux0
 
         def step(x, inputs):
             key, t, t_prev = inputs
@@ -565,20 +587,26 @@ def make_chunk_runner(
             active = (t <= t_release).astype(x.dtype)
             inv_mass = inv_mass0 + mass_sigma_frac * sigma_fn(t) ** 2 * scene_mask
             if nuisance_log_prior is None:
-                x, out, _ = corrector(key_corr, x, t, extra_var, inv_mass, active, step_size, L, value_and_grad)
+                x, out, _, _ = corrector(key_corr, x, t, extra_var, inv_mass, active, step_size, L, value_and_grad)
                 out_n = (jnp.nan, jnp.nan, False)
             else:
                 # scene sub-step on the scene coordinates only ...
-                x, out, score = corrector(key_corr, x, t, extra_var, inv_mass, active * scene_mask, step_size, L, value_and_grad)
+                x, out, score, _ = corrector(key_corr, x, t, extra_var, inv_mass, active * scene_mask, step_size, L, value_and_grad)
                 # ... then the released non-scene coordinates with the scene held
                 # at x_hat, the scene the likelihood sees (free: the score is the
                 # one the scene step ended on)
                 x_hat = x + target.shift(t, score)
-                y, out_n6, _ = corrector(
+                y, out_n6, _, aux0_n = corrector(
                     key_nuis, x_hat, t, extra_var, inv_mass, active * (1.0 - scene_mask), step_size_nuis, nuisance_steps,
                     nuis_value_and_grad,
                 )
                 x = jnp.where(scene_mask > 0, x, y)  # scene coordinates keep their raw values
+                # the logged density describes the state returned: the likelihood
+                # after the non-scene move, and the prior with its nuisance part
+                # swapped (the host prior term is the scene step's, unchanged)
+                ll_new, lpn_new, lpn_old = out_n6[1], out_n6[2], aux0_n[1]
+                lpr_new = out[2] - lpn_old + lpn_new
+                out = (ll_new + lpr_new, ll_new, lpr_new) + out[3:]
                 out_n = (out_n6[3], out_n6[4], out_n6[5])
             return x, out + (pred_rms,) + out_n
 
@@ -598,18 +626,20 @@ def make_chunk_runner(
 #####################################################################
 def make_score_fn(target, broaden_fn, scene_idx):
     """
-    Jitted, chain-vmapped: score(x, t, jj, inv_mass) -> (chains, len(SCORE_FIELDS)).
+    Jitted, chain-vmapped: score(x, t, jj, inv_mass) -> (scores, logdensity)
+    with scores (chains, len(SCORE_FIELDS)) and logdensity (chains,) the
+    target's value at x (the states handed in, e.g. after the Gibbs refresh).
     The likelihood part is the force the corrector uses (at the denoised scene).
     """
     scene_idx = jnp.asarray(scene_idx)
 
     def single(x, t, jj, inv_mass):
-        _, _, gl, gp = target.parts(x, t, broaden_fn(t) * jj)
+        ll, lp, gl, gp = target.parts(x, t, broaden_fn(t) * jj)
         gls, gps, ms = gl[scene_idx], gp[scene_idx], inv_mass[scene_idx]
         norm = lambda v: jnp.sqrt(jnp.sum(v * v))
         mnorm = lambda v: jnp.sqrt(jnp.sum(ms * v * v))
         cos = jnp.sum(gls * gps) / (norm(gls) * norm(gps) + jnp.finfo(x.dtype).tiny)
-        return jnp.stack([norm(gl), norm(gp), norm(gls), norm(gps), mnorm(gls), mnorm(gps), cos])
+        return jnp.stack([norm(gl), norm(gp), norm(gls), norm(gps), mnorm(gls), mnorm(gps), cos]), ll + lp
 
     return jax.jit(jax.vmap(single, in_axes=(0, None, None, None)))
 
@@ -666,11 +696,16 @@ def make_linear_gibbs_fn(images, data, weight, broaden_fn, lin, denoise=None, ex
     variables, so the move is an exact Metropolis-Hastings step for the
     target in the unconstrained coordinates. A proposal that sends a flux
     below zero is rejected for that image only (the model forbids it; for a
-    faint epoch that happens often and must not block the other epochs). c_mean and c_cov are the
-    conditional mean and covariance of the physical values given the rest of
-    the state, which the plots use as the Rao-Blackwellised flux estimate.
-    `denoise(x, t)` (Target.denoise) gives the scene the likelihood sees;
-    the base image and the columns are rendered there.
+    faint epoch that happens often and must not block the other epochs).
+    A ridge `extra_jitter` x the mean diagonal is added to A so a column
+    without support stays solvable; the proposal then differs from the
+    likelihood conditional by exp(-jitter |c|^2 / 2), and the acceptance
+    ratio carries the matching term, so the move stays exact. c_mean and
+    c_cov are the mean and covariance of that Gaussian proposal (the
+    likelihood's conditional of the physical values given the rest of the
+    state, before the prior and the positivity constraint), not posterior
+    moments. `denoise(x, t)` (Target.denoise) gives the scene the likelihood
+    sees; the base image and the columns are rendered there.
     """
     lin_idx = jnp.asarray(lin["idx"])
     lin_group = np.asarray(lin["group"])
@@ -710,7 +745,8 @@ def make_linear_gibbs_fn(images, data, weight, broaden_fn, lin, denoise=None, ex
         r = data - images(x_hat) + phi_a.T @ c  # data minus the base image
         pw = phi_a * w[None, :]
         A = pw @ phi_a.T + jnp.diag(1.0 - active)
-        A = A + jnp.diag(active) * (extra_jitter * jnp.trace(A) / K + 1e-30)  # a column without support stays solvable
+        jitter = extra_jitter * jnp.trace(A) / K + 1e-30
+        A = A + jnp.diag(active) * jitter  # a column without support stays solvable
         b = pw @ r + (1.0 - active) * c
         L = jnp.linalg.cholesky(A)
         c_mean = jax.scipy.linalg.cho_solve((L, True), b)
@@ -727,6 +763,7 @@ def make_linear_gibbs_fn(images, data, weight, broaden_fn, lin, denoise=None, ex
         per_coord = (
             -0.5 * prior_prec * ((x_lin_new - prior_mean) ** 2 - (x_lin - prior_mean) ** 2)
             + jnp.where(lin_is_log & (active > 0), x_lin - x_lin_new, 0.0)  # Jacobian of c = exp(x)
+            + 0.5 * jitter * (c_new**2 - c**2) * active  # likelihood / proposal mismatch from the ridge
         )
         bad = (active > 0) & ((lin_is_log & (c_new <= 0)) | ~jnp.isfinite(c_new) | ~jnp.isfinite(per_coord))
         log_alpha = jax.ops.segment_sum(jnp.where(bad, 0.0, per_coord), lin_image, n_images)

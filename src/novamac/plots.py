@@ -15,7 +15,7 @@ and writes PDFs next to the products:
                                formula, x + sigma_t^2 score: the scene the
                                likelihood sees (before the -v_t/2 mean shift)
   {name}_sample_fluxes.pdf     light curve from every saved state, the
-                               reference light curve overlaid, the t=0 states
+                               reference light curve overlaid, the posterior draws
                                highlighted
   {name}_sample_flux_trace.pdf point-source flux of each non-template image
                                vs saved step
@@ -48,10 +48,12 @@ from ._backend import DTYPE  # noqa: E402
 from .hmc import SCORE_FIELDS, block_indices, make_log_parts, make_sigma_fn  # noqa: E402
 from .products import (  # noqa: E402
     collect_fluxes,
-    conditional_fluxes,
+    draw_states,
     load_chain_state,
+    proposal_flux_moments,
     read_param_history,
     read_scene_history,
+    summarize_draws,
 )
 from .utils import Timer, get_fluxes, log  # noqa: E402
 
@@ -72,6 +74,8 @@ def phase_marks(trace):
     """(step, label) of the schedule's phase boundaries."""
     warmup, anneal = int(trace["warmup_steps"]), int(trace["anneal_steps"])
     marks = [(warmup, "anneal start"), (warmup + anneal, "hold (t=0)")]
+    if "draws_from_step" in trace and int(trace["draws_from_step"]) > warmup + anneal:
+        marks.append((int(trace["draws_from_step"]), "kernels fixed: draws"))
     if int(trace.get("likelihood_on_step", 0)) > 0:
         marks.append((int(trace["likelihood_on_step"]), "likelihood on"))
     if "restart_step" in trace:
@@ -210,16 +214,15 @@ def _trace_panel(ax, saved_step, series, n_chains, trace, ylabel, log_scale=Fals
 
 
 def plot_lightcurve(nm, fluxes=None, trace=None):
-    """Flux vs MJD (or image index) for every saved state; the t = 0 states
-    are the actual posterior draws and are highlighted, earlier (annealed)
-    states are grey. The reference light curve, if given, is overlaid."""
+    """Flux vs MJD (or image index) for every saved state; the states saved
+    once every kernel was fixed are the posterior draws and are highlighted,
+    earlier states are grey. The reference light curve, if given, is overlaid."""
     trace = nm.load_trace() if trace is None else trace
     n_chains = int(trace["num_chains"])
     fluxes = collect_fluxes(nm.files, n_chains) if fluxes is None else fluxes
     n_chains, n_saved, P, N = fluxes.shape
-    saved_t = trace["saved_t"][:n_saved]
     keep = ~nm.is_template
-    final = saved_t == 0
+    final = draw_states(trace)[:n_saved]
     x = np.arange(N) if nm.mjd is None else nm.mjd
     paths = []
     for p in range(P):
@@ -230,8 +233,8 @@ def plot_lightcurve(nm, fluxes=None, trace=None):
                 ax.scatter(x[keep], fluxes[c, k, p, keep], s=4, c="0.6", alpha=0.3, lw=0)
             for k in np.where(final)[0]:
                 ax.scatter(x[keep], fluxes[c, k, p, keep], s=12, c=color, alpha=0.8, lw=0)
-            ax.scatter([], [], c=color, label=f"chain {c} (t=0 states)")
-        ax.scatter([], [], c="0.6", label="annealed (t>0) states")
+            ax.scatter([], [], c=color, label=f"chain {c} (posterior draws)")
+        ax.scatter([], [], c="0.6", label="earlier states")
         if nm.reference_flux is not None:
             ax.scatter(x[keep], nm.reference_flux[keep], c="k", marker="x", label="reference", zorder=5)
         ax.set_yscale("log")
@@ -605,12 +608,21 @@ def plot_all(nm, raise_errors=False):
     attempt("Tweedie progression plot", lambda: plot_tweedie(nm, trace))
     fluxes = collect_fluxes(nm.files, n_chains)
     log(f"fluxes shape (chains, saved, P, N) = {fluxes.shape}, all finite: {np.all(np.isfinite(fluxes))}")
-    conditional = conditional_fluxes(trace)
-    if conditional is not None:
-        for p in sorted(k for k in conditional if isinstance(k, int)):
-            imgs = sorted(conditional[p])
-            log(f"source {p}: conditional flux over {conditional['n_states']} hold states, first/last image "
-                f"{conditional[p][imgs[0]][0]:.4g} +- {conditional[p][imgs[0]][1]:.3g} / {conditional[p][imgs[-1]][0]:.4g} +- {conditional[p][imgs[-1]][1]:.3g}")
+    summary = summarize_draws(fluxes, trace)
+    sn = np.where(~nm.is_template)[0]
+    if summary is not None and len(sn):
+        mean, std, n_draws = summary
+        for p in range(mean.shape[0]):
+            log(f"source {p}: posterior flux over {n_draws} draws, first/last transient image "
+                f"{mean[p, sn[0]]:.4g} +- {std[p, sn[0]]:.3g} / {mean[p, sn[-1]]:.4g} +- {std[p, sn[-1]]:.3g}")
+    else:
+        log("no posterior draws saved yet (the hold has not reached the fixed-kernel phase)")
+    proposal = proposal_flux_moments(trace)
+    if proposal is not None:
+        for p in sorted(k for k in proposal if isinstance(k, int)):
+            imgs = sorted(proposal[p])
+            log(f"source {p}: Gibbs proposal (likelihood conditional) flux over {proposal['n_states']} draw chunks, first/last image "
+                f"{proposal[p][imgs[0]][0]:.4g} +- {proposal[p][imgs[0]][1]:.3g} / {proposal[p][imgs[-1]][0]:.4g} +- {proposal[p][imgs[-1]][1]:.3g}")
     attempt("light curve", lambda: plot_lightcurve(nm, fluxes, trace))
     attempt("flux traces", lambda: plot_flux_traces(nm, fluxes, trace))
     attempt("parameter traces", lambda: plot_parameter_traces(nm, trace))

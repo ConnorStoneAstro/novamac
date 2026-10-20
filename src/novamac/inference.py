@@ -27,7 +27,10 @@ Schedule (see hmc.py for the method)
                                           scene's reverse diffusion (prior score
                                           only), then one HMC corrector
                                           transition at the new t (likelihood)
-  hold     hold_steps at t = 0            HMC only at the true posterior
+  hold     hold_steps at t = 0            HMC only at the true posterior; the
+                                          step sizes adapt for hold_adapt_chunks
+                                          more chunks, then every kernel is fixed
+                                          and the saved states are the draws
 
 Mass matrix: fixed in shape, inv_mass(t) = inv_mass0 + mass_sigma_fraction *
 sigma(t)^2 on the scene, with inv_mass0 a Gauss-Newton estimate of the t = 0
@@ -75,7 +78,13 @@ from .hmc import (
     release_inverse_mass,
 )
 from .host_prior import Prior, load_prior
-from .init_scene import aperture_fluxes, border_sky, cd_arcsec, data_pixel_scale, prepare_initial_scene
+from .init_scene import (
+    aperture_fluxes,
+    border_sky,
+    cd_arcsec,
+    data_pixel_scale,
+    prepare_initial_scene,
+)
 from .psf import fit_moffat_psfs
 from .products import RunFiles
 from .sampler import (
@@ -92,7 +101,9 @@ from .sampler import (
 )
 from .utils import Timer, enable_console_logging, log, save_json
 
-NATIVE_PRIOR_PIXEL_ARCSEC = 0.2  # the Rubin pixel the host priors are trained on, unless the prior's config says otherwise
+NATIVE_PRIOR_PIXEL_ARCSEC = (
+    0.2  # the Rubin pixel the host priors are trained on, unless the prior's config says otherwise
+)
 
 
 class Novamac:
@@ -114,7 +125,13 @@ class Novamac:
     sigma_start = 1.0
     warmup_steps = 256  # at t = t_start, HMC only
     anneal_steps = 2048  # t from t_start down to 0, predictor + corrector
-    hold_steps = 256  # at t = 0: the states here are the posterior draws; a drift across them means the chain is still settling
+    hold_steps = 256  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
+    # The step sizes keep adapting for this many chunks of the hold (the cut at
+    # the hold start is a guess) and are then frozen, chain restarts stop, and
+    # the states saved from then on (trace "draws_from_step") are the posterior
+    # draws: a state-dependent adaptation or restart during collection would
+    # break the fixed-kernel stationarity the draws rely on.
+    hold_adapt_chunks = 4
     # The anneal acceptance is inflated by the predictor (each corrector starts
     # from a slightly displaced state, so its proposals tend to go uphill), which
     # lets the step size grow past what plain HMC at t = 0 can use. The step size
@@ -158,12 +175,12 @@ class Novamac:
     # frozen in the prior-only and frozen test modes, where nothing constrains it.
     freeze_scene_scale = False
     release_t = {
-        "scene_scale": None,  # the scene's overall scale factor: free from the start (if not frozen)
+        "scene_scale": 0.4,  # the scene's overall scale factor: free from the start (if not frozen)
         "sky": 0.7,
         "alignment": 0.7,  # per-image crtan
-        "ps_flux": 0.2,
+        "ps_flux": 0.25,
         "ps_center": 0.3,
-        "psf": 0.2,
+        "psf": 0.25,
     }
     # Blocks listed here are not released at release_t unconditionally: from
     # release_t on, their curvature is probed every release_probe_every chunks and
@@ -178,8 +195,9 @@ class Novamac:
     # exact conditional given everything else (hmc.make_linear_gibbs_fn): the
     # model is linear in them, so this is a weighted least-squares solve per
     # image and an exact Metropolis-Hastings move. Only coordinates that have been
-    # released take part. The conditional mean and covariance are stored per
-    # chunk; over the hold phase they are the Rao-Blackwellised flux estimate.
+    # released take part. The proposal's mean and covariance (the likelihood's
+    # conditional of the physical values, before the prior and the positivity
+    # constraint) are stored per chunk.
     linear_gibbs = True
     # Blocked HMC: each step is predictor -> HMC on the scene -> HMC on the
     # released non-scene blocks (alignment, PSF, centres, fluxes, sky, scale)
@@ -255,7 +273,9 @@ class Novamac:
     rewarm_chunks = 4  # also used after every block release, for the non-scene step
 
     initial_step_size = 0.1  # starting point of the step size search
-    initial_step_clip = 2.0  # per-chain initial step sizes are clipped to within this factor of the chain median
+    initial_step_clip = (
+        2.0  # per-chain initial step sizes are clipped to within this factor of the chain median
+    )
     target_acceptance = 0.6
     acceptance_tol = 0.05
     step_down, step_up = 0.7, 1.2  # during annealing / hold
@@ -412,7 +432,9 @@ class Novamac:
         for k in ("release_t", "release_latest_t", "prior_widths"):  # never share a mutable default
             setattr(self, k, dict(getattr(self, k)))
         for k, v in settings.items():
-            setattr(self, k, dict(getattr(self, k), **v) if isinstance(getattr(self, k), dict) else v)
+            setattr(
+                self, k, dict(getattr(self, k), **v) if isinstance(getattr(self, k), dict) else v
+            )
 
         # Data
         self.data = np.asarray(data, dtype=float)
@@ -422,9 +444,15 @@ class Novamac:
             raise ValueError("give exactly one of weight and variance")
         if weight is None:
             variance = np.asarray(variance, dtype=float)
-            weight = np.where(np.isfinite(variance) & (variance > 0), 1.0 / np.where(variance > 0, variance, 1.0), 0.0)
+            weight = np.where(
+                np.isfinite(variance) & (variance > 0),
+                1.0 / np.where(variance > 0, variance, 1.0),
+                0.0,
+            )
         self.weight = np.asarray(weight, dtype=float)
-        self.mask = np.zeros(self.data.shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        self.mask = (
+            np.zeros(self.data.shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        )
         self.is_template = np.asarray(is_template, dtype=bool)
         self.crpix = np.asarray(crpix, dtype=float)
         self.crtan = np.asarray(crtan, dtype=float)
@@ -434,18 +462,26 @@ class Novamac:
         given = [a is not None for a in (psf_n, psf_Rd, psf_q, psf_PA)]
         if psf_images is not None:
             if any(given):
-                raise ValueError("give either psf_images or the Moffat parameters psf_n, psf_Rd, psf_q, psf_PA, not both")
+                raise ValueError(
+                    "give either psf_images or the Moffat parameters psf_n, psf_Rd, psf_q, psf_PA, not both"
+                )
             psf_images = [np.asarray(im, dtype=float) for im in psf_images]
             if len(psf_images) != self.data.shape[0]:
                 raise ValueError("psf_images must have one image per epoch")
             fitted = fit_moffat_psfs(psf_images, upsample=self.psf_upsample)
-            psf_n, psf_Rd, psf_q, psf_PA = (fitted[k] for k in ("psf_n", "psf_Rd", "psf_q", "psf_PA"))
+            psf_n, psf_Rd, psf_q, psf_PA = (
+                fitted[k] for k in ("psf_n", "psf_Rd", "psf_q", "psf_PA")
+            )
             if psf_shape is None:
                 h, w = psf_images[0].shape
                 psf_shape = (h // self.psf_upsample, w // self.psf_upsample)
         elif not all(given):
-            raise ValueError("give the Moffat PSF parameters psf_n, psf_Rd, psf_q, psf_PA (all four) or psf_images")
-        self.psf_n, self.psf_Rd, self.psf_q, self.psf_PA = (np.asarray(a, dtype=float) for a in (psf_n, psf_Rd, psf_q, psf_PA))
+            raise ValueError(
+                "give the Moffat PSF parameters psf_n, psf_Rd, psf_q, psf_PA (all four) or psf_images"
+            )
+        self.psf_n, self.psf_Rd, self.psf_q, self.psf_PA = (
+            np.asarray(a, dtype=float) for a in (psf_n, psf_Rd, psf_q, psf_PA)
+        )
         self.psf_shape = (15, 15) if psf_shape is None else tuple(int(s) for s in psf_shape)
         self.zeropoint = float(zeropoint)
         self.ps_center = np.asarray(ps_center, dtype=float)
@@ -458,16 +494,24 @@ class Novamac:
         self.name = str(name)
         self.files = RunFiles(out_dir, self.name)
         self.mjd = None if mjd is None else np.asarray(mjd, dtype=float)
-        self.reference_flux = None if reference_flux is None else np.asarray(reference_flux, dtype=float)
+        self.reference_flux = (
+            None if reference_flux is None else np.asarray(reference_flux, dtype=float)
+        )
         N = self.n_images
-        self.target_names = list(target_names) if target_names is not None else [f"target_t{int(t)}_{i}" for i, t in enumerate(self.is_template)]
+        self.target_names = (
+            list(target_names)
+            if target_names is not None
+            else [f"target_t{int(t)}_{i}" for i, t in enumerate(self.is_template)]
+        )
         for nm_, shape in (("weight", self.data.shape), ("mask", self.data.shape), ("is_template", (N,)), ("crpix", (N, 2)),
                            ("crtan", (N, 2)), ("crval", (2,)), ("CD", (N, 2, 2)), ("psf_n", (N,)), ("psf_Rd", (N,)),
                            ("psf_q", (N,)), ("psf_PA", (N,))):  # fmt: skip
             if getattr(self, nm_).shape != shape:
                 raise ValueError(f"{nm_} must have shape {shape}, got {getattr(self, nm_).shape}")
         if self.ps_flux is not None and self.ps_flux.shape != (self.n_sources, N):
-            raise ValueError(f"ps_flux must have shape {(self.n_sources, N)}, got {self.ps_flux.shape}")
+            raise ValueError(
+                f"ps_flux must have shape {(self.n_sources, N)}, got {self.ps_flux.shape}"
+            )
         if len(self.target_names) != N:
             raise ValueError("target_names must have one entry per image")
         unmasked = ~self.mask
@@ -480,9 +524,15 @@ class Novamac:
         self.prior = prior if isinstance(prior, Prior) else load_prior(prior)
         cfg = self.prior.config
         if prior_pixel_scale is None:
-            prior_pixel_scale = cfg.get("pixel_scale", cfg.get("patch", {}).get("pixel_scale", NATIVE_PRIOR_PIXEL_ARCSEC))
+            prior_pixel_scale = cfg.get(
+                "pixel_scale", cfg.get("patch", {}).get("pixel_scale", NATIVE_PRIOR_PIXEL_ARCSEC)
+            )
         self.prior_pixel_scale = float(prior_pixel_scale)  # arcsec per native training pixel
-        self.scene_pixel_scale = float(self.prior_pixel_scale * self.prior.pool_factor if scene_pixel_scale is None else scene_pixel_scale)
+        self.scene_pixel_scale = float(
+            self.prior_pixel_scale * self.prior.pool_factor
+            if scene_pixel_scale is None
+            else scene_pixel_scale
+        )
         self.scene_shape = (int(self.prior.size), int(self.prior.size))
         self.data_pixel_scale = data_pixel_scale(self.CD)
         # The model renders scale * I with I in the prior's units (nJy per native
@@ -492,7 +542,9 @@ class Novamac:
         self.njy_per_count = 10 ** ((8.90 - self.zeropoint) / 2.5) * 1e9
         self.scene_scale0 = 1.0 / (self.prior_pixel_scale**2 * self.njy_per_count)
         if self.init_image is not None and self.init_image.shape != self.scene_shape:
-            raise ValueError(f"init_image must be on the scene grid {self.scene_shape} (the prior's), got {self.init_image.shape}")
+            raise ValueError(
+                f"init_image must be on the scene grid {self.scene_shape} (the prior's), got {self.init_image.shape}"
+            )
 
         self.likelihood_args = None  # built by prepare()
         self.init_info = None
@@ -511,7 +563,10 @@ class Novamac:
 
     def settings(self):
         """The settings in force for this instance."""
-        return {k: (dict(v) if isinstance(v, dict) else v) for k, v in ((k, getattr(self, k)) for k in self.setting_names())}
+        return {
+            k: (dict(v) if isinstance(v, dict) else v)
+            for k, v in ((k, getattr(self, k)) for k in self.setting_names())
+        }
 
     @property
     def n_images(self):
@@ -529,7 +584,9 @@ class Novamac:
         rendered scene). Idempotent."""
         if self.likelihood_args is not None:
             return self
-        border = border_sky(self.data, self.mask, self.init_sky_border) if self.init_sky_border else None
+        border = (
+            border_sky(self.data, self.mask, self.init_sky_border) if self.init_sky_border else None
+        )
         if self.sky is None:
             # the model's sky is a surface brightness (flux per arcsec^2)
             area = np.abs(np.linalg.det(cd_arcsec(self.CD)))
@@ -591,7 +648,9 @@ class Novamac:
         raw = np.asarray(self.init_info["raw"], dtype=float) / self.scene_scale0
         pix.I.value = np.where(raw > 0, raw, 1e-6 * max(float(raw.max()), 1e-30))
         for p in range(self.n_sources):
-            model.models[f"ps_batch_model_{p}"].model.flux.allflux.value = np.full(self.n_images, 1e-6)
+            model.models[f"ps_batch_model_{p}"].model.flux.allflux.value = np.full(
+                self.n_images, 1e-6
+            )
         rendered = np.asarray(model().flatten("data")).reshape(self.data.shape)
         pix.I.value = prepared
         residual = self.data - rendered
@@ -603,8 +662,10 @@ class Novamac:
             est = np.where(np.isfinite(est) & (est > 0), est, 1.0)
             fluxes[p] = np.where(self.is_template, 1.0, est)
             sn = ~self.is_template
-            log(f"initial flux of source {p} from aperture photometry ({self.init_aperture_fwhm:g} FWHM): "
-                f"{np.array2string(flux[sn], precision=3)} +- {np.array2string(err[sn], precision=3)} on the {int(sn.sum())} transient epochs")
+            log(
+                f"initial flux of source {p} from aperture photometry ({self.init_aperture_fwhm:g} FWHM): "
+                f"{np.array2string(flux[sn], precision=3)} +- {np.array2string(err[sn], precision=3)} on the {int(sn.sum())} transient epochs"
+            )
         return fluxes
 
     def geometry_report(self):
@@ -677,7 +738,9 @@ class Novamac:
         with Timer("build model", timings):
             model = self.build_model()
         likelihood_args = self.likelihood_args
-        log(f"{self.name}: {self.n_images} cutouts ({int(self.is_template.sum())} templates), {self.n_sources} point source(s)")
+        log(
+            f"{self.name}: {self.n_images} cutouts ({int(self.is_template.sum())} templates), {self.n_sources} point source(s)"
+        )
         for line in self.geometry_report():
             log(line)
 
@@ -692,11 +755,19 @@ class Novamac:
         log_lik, log_prior, images = make_log_parts(model, group1)
         log_prior_nuisance = make_nuisance_log_prior(model, group1) if self.nuisance_hmc else None
         if self.nuisance_hmc and log_prior_nuisance is None:
-            log("WARNING: the model has no log_prior_nuisance; non-scene blocks move in the scene HMC with the shared step size")
+            log(
+                "WARNING: the model has no log_prior_nuisance; non-scene blocks move in the scene HMC with the shared step size"
+            )
         no_likelihood = not self.likelihood
         if no_likelihood:
-            log("TEST MODE: likelihood switched off, sampling the prior alone; non-scene blocks stay frozen"
-                + ("; starting from the t=1 marginal" if self.prior_only_from_noise else "; starting like a real run (initial scene + noise at t_start)"))
+            log(
+                "TEST MODE: likelihood switched off, sampling the prior alone; non-scene blocks stay frozen"
+                + (
+                    "; starting from the t=1 marginal"
+                    if self.prior_only_from_noise
+                    else "; starting like a real run (initial scene + noise at t_start)"
+                )
+            )
             log_lik = jax.jit(lambda x, extra_var: jnp.zeros((), dtype=x.dtype))
         sde = model.meta.host_prior.sde
         sigma_fn = make_sigma_fn(sde)
@@ -704,11 +775,19 @@ class Novamac:
         data_std = self.prior.config["sde"].get("data_std")
         if tweedie and data_std is None:
             raise ValueError("tweedie needs the prior's data_std (sde.data_std in its config.json)")
-        broaden_fn = make_broadening_fn(sde, float(data_std) if tweedie else None)  # extra variance = broaden_fn(t) * diag(JJ^T)
-        log_var_fn = make_log_variance_fn(sde, float(data_std) if tweedie else None) if (self.mean_correction and not no_likelihood) else None
+        broaden_fn = make_broadening_fn(
+            sde, float(data_std) if tweedie else None
+        )  # extra variance = broaden_fn(t) * diag(JJ^T)
+        log_var_fn = (
+            make_log_variance_fn(sde, float(data_std) if tweedie else None)
+            if (self.mean_correction and not no_likelihood)
+            else None
+        )
         from_noise = no_likelihood and self.prior_only_from_noise
         t_start = 1.0 if from_noise else start_time(sde, self.sigma_start)
-        log(f"schedule starts at t={t_start:.3f} (sigma={float(sigma_fn(t_start)):.3g}; sigma range [{sde.sigma_min:.3g}, {sde.sigma_max:.3g}])")
+        log(
+            f"schedule starts at t={t_start:.3f} (sigma={float(sigma_fn(t_start)):.3g}; sigma range [{sde.sigma_min:.3g}, {sde.sigma_max:.3g}])"
+        )
 
         pix = model.models.pixelated_batch_model.model
         scene_idx = block_indices(model, [pix.I])
@@ -717,26 +796,50 @@ class Novamac:
         if self.prior_energy_offset:
             rng, key_off = jax.random.split(rng)
             with Timer("prior energy offset calibration", timings):
-                scene_log = np.asarray(x0)[scene_idx].reshape(pix.I.shape)  # log I of the initial scene
-                prior_offset_table = calibrate_prior_offset(model, scene_log, key_off, self.prior_offset_sigmas)
+                scene_log = np.asarray(x0)[scene_idx].reshape(
+                    pix.I.shape
+                )  # log I of the initial scene
+                prior_offset_table = calibrate_prior_offset(
+                    model, scene_log, key_off, self.prior_offset_sigmas
+                )
             sg, val = prior_offset_table
-            log(f"prior energy offset per pixel: {val[0]:.4g} at sigma={sg[0]:.3g} ... {val[-1]:.4g} at sigma={sg[-1]:.3g} "
-                f"(x{len(scene_idx)} pixels; subtracted inside the prior's sum so the logged log prior is relative to a typical noised scene)")
+            log(
+                f"prior energy offset per pixel: {val[0]:.4g} at sigma={sg[0]:.3g} ... {val[-1]:.4g} at sigma={sg[-1]:.3g} "
+                f"(x{len(scene_idx)} pixels; subtracted inside the prior's sum so the logged log prior is relative to a typical noised scene)"
+            )
         scene_mask = np.zeros(dim)
         scene_mask[scene_idx] = 1.0
-        target = make_target(log_lik, log_prior, sigma_fn, as_dev(scene_mask), tweedie, self.tweedie_exact_jacobian, log_var_fn)
+        target = make_target(
+            log_lik,
+            log_prior,
+            sigma_fn,
+            as_dev(scene_mask),
+            tweedie,
+            self.tweedie_exact_jacobian,
+            log_var_fn,
+        )
         if log_var_fn is not None:
-            log(f"mean correction: the likelihood renders the scene at x - v_t/2 (v_{{t_start}}/2 = {0.5 * float(log_var_fn(t_start)):.3g} in log I)")
+            log(
+                f"mean correction: the likelihood renders the scene at x - v_t/2 (v_{{t_start}}/2 = {0.5 * float(log_var_fn(t_start)):.3g} in log I)"
+            )
         # the prior-only target used while the likelihood is off (no likelihood cost at all)
         zero_lik = jax.jit(lambda x, extra_var: jnp.zeros((), dtype=x.dtype))
         target_off = make_target(zero_lik, log_prior, sigma_fn, as_dev(scene_mask), False, False)
         if not no_likelihood and self.likelihood_t is not None:
-            log(f"likelihood switched on {'from the first annealing step' if self.likelihood_t == 'anneal' else f'once t <= {float(self.likelihood_t):g}'}; "
-                f"prior alone before that (step size x{self.likelihood_step_factor:g} at the switch, then {self.rewarm_chunks} chunks of warmup-rate adaptation)")
+            log(
+                f"likelihood switched on {'from the first annealing step' if self.likelihood_t == 'anneal' else f'once t <= {float(self.likelihood_t):g}'}; "
+                f"prior alone before that (step size x{self.likelihood_step_factor:g} at the switch, then {self.rewarm_chunks} chunks of warmup-rate adaptation)"
+            )
         if tweedie:
-            log(f"Tweedie: likelihood evaluated at x + sigma_t^2 * prior score on the scene for t > 0 (plain at t = 0); "
+            log(
+                f"Tweedie: likelihood evaluated at x + sigma_t^2 * prior score on the scene for t > 0 (plain at t = 0); "
                 f"broadening uses sigma^2 s^2 / (sigma^2 + s^2) with s = {float(data_std):.3g}"
-                + ("; exact denoiser Jacobian in the force" if self.tweedie_exact_jacobian else "; identity Jacobian in the force"))
+                + (
+                    "; exact denoiser Jacobian in the force"
+                    if self.tweedie_exact_jacobian
+                    else "; identity Jacobian in the force"
+                )
+            )
         pflow_reference = None
         for line in self.init_info["report"]:
             log(line)
@@ -746,13 +849,19 @@ class Novamac:
             # thing since I = exp(x) is the prior's to_flux
             rng, key_start = jax.random.split(rng)
             prior = model.meta.host_prior
-            noise = prior.sde.data_mean + prior.sde.sigma_max * jax.random.normal(key_start, (len(scene_idx),), DTYPE)
-            noise = noise - float(np.log(getattr(model.meta, "prior_scene_factor", 1.0)))  # prior units -> scene units
+            noise = prior.sde.data_mean + prior.sde.sigma_max * jax.random.normal(
+                key_start, (len(scene_idx),), DTYPE
+            )
+            noise = noise - float(
+                np.log(getattr(model.meta, "prior_scene_factor", 1.0))
+            )  # prior units -> scene units
             n_clipped = int(jnp.sum(jnp.abs(noise) > self.max_abs_log_scene))
             noise = jnp.clip(noise, -self.max_abs_log_scene, self.max_abs_log_scene)
             x0 = x0.at[jnp.asarray(scene_idx)].set(noise)
             if n_clipped:
-                log(f"  {n_clipped} start pixels clipped to |log I| <= {self.max_abs_log_scene:g} (float32 exp range)")
+                log(
+                    f"  {n_clipped} start pixels clipped to |log I| <= {self.max_abs_log_scene:g} (float32 exp range)"
+                )
             log(f"scene started from the t=1 marginal (sigma_max={prior.sde.sigma_max:.3g})")
         if no_likelihood:
             rng, key_ref = jax.random.split(rng)
@@ -760,7 +869,9 @@ class Novamac:
             with Timer("pflow reference sample (includes compile)", timings):
                 ref = prior.sample(key_ref, n=C, n_steps=self.pflow_reference_steps)
                 # (chains, H, W) in the scene's units (the prior's flux divided by the factor it is shown)
-                pflow_reference = np.asarray(prior.to_flux(ref))[:, 0] / float(getattr(model.meta, "prior_scene_factor", 1.0))
+                pflow_reference = np.asarray(prior.to_flux(ref))[:, 0] / float(
+                    getattr(model.meta, "prior_scene_factor", 1.0)
+                )
             log(f"pflow reference drawn with {self.pflow_reference_steps} Heun steps")
         blocks = parameter_blocks(model, self.release_t, self.release_latest_t)
         # per-coordinate release time handed to the runner: +inf = free, -inf =
@@ -771,7 +882,9 @@ class Novamac:
         for b in blocks:
             if (no_likelihood or self.freeze_non_scene) and b.name != "scene_scale":
                 b.freeze()  # never released
-            if b.name == "scene_scale" and (self.freeze_scene_scale or no_likelihood or self.freeze_non_scene):
+            if b.name == "scene_scale" and (
+                self.freeze_scene_scale or no_likelihood or self.freeze_non_scene
+            ):
                 b.freeze()  # fixed unit conversion (nothing constrains it without the likelihood)
             t_release[b.idx] = np.inf if b.t_earliest >= t_start else -np.inf
         log(f"{dim} parameters: {len(scene_idx)} scene pixels")
@@ -788,38 +901,65 @@ class Novamac:
             jj = jnp.zeros(int(np.prod(self.data.shape)), dtype=DTYPE)
         else:
             with Timer("Jacobian diagonal (Hutchinson, includes compile)", timings):
-                jj = hutchinson_jj_diag(images, x0, scene_idx, key, self.hutchinson_probes, self.hutchinson_batch)
+                jj = hutchinson_jj_diag(
+                    images, x0, scene_idx, key, self.hutchinson_probes, self.hutchinson_batch
+                )
                 jax.block_until_ready(jj)
         jj_np = np.asarray(jj)
         if not np.all(np.isfinite(jj_np)):
             raise RuntimeError(f"{self.name}: non-finite Jacobian diagonal")
         data_var = 1.0 / np.where(self.weight > 0, self.weight, np.inf).ravel()
         ratio_start = float(broaden_fn(t_start)) * jj_np / data_var
-        log(f"diag(JJ^T): median {np.median(jj_np):.3g}, max {np.max(jj_np):.3g}; "
-            f"extra/data variance at the start: median {np.median(ratio_start):.3g}, max {np.max(ratio_start):.3g}")
+        log(
+            f"diag(JJ^T): median {np.median(jj_np):.3g}, max {np.max(jj_np):.3g}; "
+            f"extra/data variance at the start: median {np.median(ratio_start):.3g}, max {np.max(ratio_start):.3g}"
+        )
 
         # Mass matrix, once: Gauss-Newton t = 0 variance estimate
         # ----------------------------------------------------------------
         with Timer("Gauss-Newton mass matrix (includes compile)", timings):
             inv_mass0, reference_var, flat, gn_curv = setup_inverse_mass(
-                model, images, x0, scene_idx, blocks, self.weight, self.mask, self.gn_stride, likelihood=not no_likelihood
+                model,
+                images,
+                x0,
+                scene_idx,
+                blocks,
+                self.weight,
+                self.mask,
+                self.gn_stride,
+                likelihood=not no_likelihood,
             )
         gibbs_fn, lin = None, None
         if self.linear_gibbs and not no_likelihood:
             lin = linear_coordinates(model, flat)
             data_flat, weight_flat = flat_data_weight(model)
-            gibbs_fn = make_linear_gibbs_fn(images, as_dev(data_flat), as_dev(weight_flat), broaden_fn, lin, denoise=target.denoise)
+            gibbs_fn = make_linear_gibbs_fn(
+                images,
+                as_dev(data_flat),
+                as_dev(weight_flat),
+                broaden_fn,
+                lin,
+                denoise=target.denoise,
+            )
             n_sky, n_flux = int(np.sum(lin["source"] < 0)), int(np.sum(lin["source"] >= 0))
-            log(f"linear Gibbs refresh once per chunk on {n_sky} sky levels + {n_flux} point source fluxes (released coordinates only)")
+            log(
+                f"linear Gibbs refresh once per chunk on {n_sky} sky levels + {n_flux} point source fluxes (released coordinates only)"
+            )
         if np.any(flat):
             # no likelihood and no prior curvature (template-image fluxes): frozen for good
             t_release[flat] = -np.inf
-            log(f"{int(np.sum(flat))} coordinates have neither likelihood nor prior curvature and stay frozen")
-        log(f"inv_mass0 (t=0 variance estimate): scene median {np.median(inv_mass0[scene_idx]):.3g} "
+            log(
+                f"{int(np.sum(flat))} coordinates have neither likelihood nor prior curvature and stay frozen"
+            )
+        log(
+            f"inv_mass0 (t=0 variance estimate): scene median {np.median(inv_mass0[scene_idx]):.3g} "
             f"(prior sigma_min^2 = {float(sde.sigma_min) ** 2:.3g}); mass at the start adds "
-            f"{self.mass_sigma_fraction} * sigma^2 = {self.mass_sigma_fraction * float(sigma_fn(t_start)) ** 2:.3g} on the scene")
+            f"{self.mass_sigma_fraction} * sigma^2 = {self.mass_sigma_fraction * float(sigma_fn(t_start)) ** 2:.3g} on the scene"
+        )
         for b in blocks:
-            log(f"  {b.name:11s} median inv_mass0 {np.median(inv_mass0[b.idx]):.3g}, prior-width variance {np.median(reference_var[b.idx]):.3g}")
+            log(
+                f"  {b.name:11s} median inv_mass0 {np.median(inv_mass0[b.idx]):.3g}, prior-width variance {np.median(reference_var[b.idx]):.3g}"
+            )
 
         # Sanity check the starting point at both ends of the schedule
         # ----------------------------------------------------------------
@@ -843,8 +983,17 @@ class Novamac:
         ts = build_schedule(t_start, self.warmup_steps, self.anneal_steps, self.hold_steps)
         ts_prev = np.concatenate([[ts[0]], ts[:-1]])  # t of the step before each step
         total = len(ts)
-        chunk_bounds = [(s, min(s + self.chunk_steps, total)) for s in range(0, total, self.chunk_steps)]
+        chunk_bounds = [
+            (s, min(s + self.chunk_steps, total)) for s in range(0, total, self.chunk_steps)
+        ]
         n_chunks = len(chunk_bounds)
+        # from this step on every kernel is fixed (no adaptation, no restarts): the draws
+        hold_start = self.warmup_steps + self.anneal_steps
+        draws_from = (
+            min(total, hold_start + self.hold_adapt_chunks * self.chunk_steps)
+            if self.hold_steps > 0
+            else total
+        )
         trace = {
             # settings
             "name": self.name,
@@ -863,6 +1012,7 @@ class Novamac:
             "mean_correction": log_var_fn is not None,
             "likelihood_t": str(self.likelihood_t),
             "likelihood_on_step": 0 if self._likelihood_on(0, t_start) else -1,  # set when the switch happens
+            "draws_from_step": draws_from,
             "score_fields": np.array(SCORE_FIELDS),
             "scene_idx": scene_idx,
             "scene_shape": np.array(pix.I.shape),
@@ -891,8 +1041,10 @@ class Novamac:
             "step_size": np.full((n_chunks, C), np.nan),
             "step_size_nuis": np.full((n_chunks, C), np.nan),
             "scores": np.full((n_chunks, C, len(SCORE_FIELDS)), np.nan),
+            "chunk_logdensity": np.full((n_chunks, C), np.nan),  # of the state at the end of the chunk, after the Gibbs refresh
             # linear Gibbs refresh at the end of each chunk: acceptance, and the
-            # conditional mean / covariance of the physical sky + flux values
+            # proposal's mean / covariance of the physical sky + flux values (the
+            # likelihood's conditional, before the prior and the positivity constraint)
             **({
                 "lin_idx": lin["idx"], "lin_image": lin["image"], "lin_source": lin["source"], "lin_is_log": lin["is_log"],
                 "gibbs_accept": np.full((n_chunks, C), np.nan),
@@ -926,18 +1078,28 @@ class Novamac:
             # noise the clean initial scene up to the warmup target's level, independently per chain
             rng, key_start = jax.random.split(rng)
             s0 = float(sigma_fn(t_start))
-            noised = positions[:, scene_dev_idx] + s0 * jax.random.normal(key_start, (C, len(scene_idx)), DTYPE)
-            positions = positions.at[:, scene_dev_idx].set(jnp.clip(noised, -self.max_abs_log_scene, self.max_abs_log_scene))
+            noised = positions[:, scene_dev_idx] + s0 * jax.random.normal(
+                key_start, (C, len(scene_idx)), DTYPE
+            )
+            positions = positions.at[:, scene_dev_idx].set(
+                jnp.clip(noised, -self.max_abs_log_scene, self.max_abs_log_scene)
+            )
             ll = float(log_lik(positions[0], broaden_fn(t_start) * jj))
             lp = float(log_prior(positions[0], t_start))
-            log(f"scene start = initial scene + N(0, {s0:.3g}^2) in log I per chain; chain 0 at t={t_start:.3g}: log likelihood {ll:.6g}, log prior {lp:.6g}")
+            log(
+                f"scene start = initial scene + N(0, {s0:.3g}^2) in log I per chain; chain 0 at t={t_start:.3g}: log likelihood {ll:.6g}, log prior {lp:.6g}"
+            )
             if not (np.isfinite(ll) and np.isfinite(lp)):
-                raise RuntimeError(f"{self.name}: non-finite log density at the noised starting point")
+                raise RuntimeError(
+                    f"{self.name}: non-finite log density at the noised starting point"
+                )
         jj_dev = as_dev(jj)
         inv_mass0_dev = as_dev(inv_mass0)
         scene_mask_dev = as_dev(scene_mask)
-        inv_mass_at = lambda t: inv_mass0 + self.mass_sigma_fraction * float(sigma_fn(t)) ** 2 * scene_mask  # noqa: E731
-        runners = {}  # (chunk length, likelihood on, nuisance step on) -> compiled runner
+        inv_mass_at = (
+            lambda t: inv_mass0 + self.mass_sigma_fraction * float(sigma_fn(t)) ** 2 * scene_mask
+        )  # noqa: E731
+        runners = {}
         make_runner = lambda n, on, nuis: make_chunk_runner(  # noqa: E731
             target if on else target_off, broaden_fn, sigma_fn, self.num_integration_steps, n, self.mass_sigma_fraction,
             self.predictor_noise, max_abs_scene=self.max_abs_log_scene, predictor=self.predictor,
@@ -946,11 +1108,20 @@ class Novamac:
         lik_on = self._likelihood_on(0, t_start)
         nuis_on = False  # the non-scene sub-step exists once a non-scene block has been released
         step_size_nuis = np.full(C, self.initial_step_size)
-        rewarm_until = -1  # chunk index until which the adaptation uses the warmup rates (set at the likelihood switch)
+        rewarm_until = (
+            -1
+        )  # chunk index until which the adaptation uses the warmup rates (set at the likelihood switch)
         rewarm_nuis_until = -1  # same for the non-scene step (set when it first exists)
-        stall_chunks = {k: np.zeros(C, dtype=int) for k in ("collapsed", "dead", "outlier")}  # consecutive chunks flagged, per chain
-        score_fn = make_score_fn(target, broaden_fn, scene_idx)
-        curvature_fns = {b.name: make_block_curvature_fn(target, broaden_fn, b.groups) for b in blocks}
+        stall_chunks = {
+            k: np.zeros(C, dtype=int) for k in ("collapsed", "dead", "outlier")
+        }  # consecutive chunks flagged, per chain
+        score_fns = {
+            True: make_score_fn(target, broaden_fn, scene_idx),
+            False: make_score_fn(target_off, broaden_fn, scene_idx),
+        }
+        curvature_fns = {
+            b.name: make_block_curvature_fn(target, broaden_fn, b.groups) for b in blocks
+        }
         # blocks that are free from the start count as released at step 0: they
         # go to the non-scene HMC sub-step from the beginning
         for bi, b in enumerate(blocks):
@@ -958,15 +1129,26 @@ class Novamac:
                 b.released_chunk = -1
                 trace["block_release_step"][bi] = 0
                 trace["block_release_t"][bi] = t_start
-                log(f"{b.name} is free from the start (t_earliest {b.t_earliest:.3g} >= t_start {t_start:.3g})")
+                log(
+                    f"{b.name} is free from the start (t_earliest {b.t_earliest:.3g} >= t_start {t_start:.3g})"
+                )
                 if log_prior_nuisance is not None and lik_on:
                     nuis_on = True
 
         with Timer("initial step size search (includes compile)", timings):
             runners[(1, lik_on, nuis_on)] = make_runner(1, lik_on, nuis_on)
             rng, step_size, step_size_nuis = find_initial_step_size(
-                runners[(1, lik_on, nuis_on)], rng, positions, inv_mass0, t_start, jj_dev, t_release, scene_mask, as_dev,
-                initial_step_size=self.initial_step_size, tune_nuis=nuis_on,
+                runners[(1, lik_on, nuis_on)],
+                rng,
+                positions,
+                inv_mass0,
+                t_start,
+                jj_dev,
+                t_release,
+                scene_mask,
+                as_dev,
+                initial_step_size=self.initial_step_size,
+                tune_nuis=nuis_on,
             )
         if C > 1:
             # the chains start statistically alike, so one chain's search landing
@@ -977,8 +1159,10 @@ class Novamac:
             for arr in (step_size, step_size_nuis) if nuis_on else (step_size,):
                 med = float(np.median(arr))
                 np.clip(arr, med / self.initial_step_clip, med * self.initial_step_clip, out=arr)
-        log(f"initial step sizes {np.array2string(step_size, precision=3)}"
-            + (f", non-scene {np.array2string(step_size_nuis, precision=3)}" if nuis_on else ""))
+        log(
+            f"initial step sizes {np.array2string(step_size, precision=3)}"
+            + (f", non-scene {np.array2string(step_size_nuis, precision=3)}" if nuis_on else "")
+        )
 
         # Tweedie estimate of the scene at every saved state, for the plots: the
         # score is one prior gradient per chain, and saving it here is far cheaper
@@ -999,7 +1183,9 @@ class Novamac:
         trace["saved_t"].append(ts[0])
         write_trace(tpath, trace)
         save_tweedie(ts[0])
-        log(f"schedule: {self.warmup_steps} warmup + {self.anneal_steps} anneal + {self.hold_steps} hold = {total} steps in {n_chunks} chunks")
+        log(
+            f"schedule: {self.warmup_steps} warmup + {self.anneal_steps} anneal + {self.hold_steps} hold = {total} steps in {n_chunks} chunks"
+        )
 
         # Chunk loop
         # ----------------------------------------------------------------
@@ -1010,20 +1196,37 @@ class Novamac:
                 trace["likelihood_on_step"] = s0
                 step_size = step_size * self.likelihood_step_factor
                 rewarm_until = ci + self.rewarm_chunks
-                log(f"likelihood on at step {s0} (t={ts[s0]:.3f}); step size x{self.likelihood_step_factor:g} -> "
-                    f"{np.array2string(np.asarray(step_size), precision=3)}, warmup-rate adaptation for {self.rewarm_chunks} chunks")
+                log(
+                    f"likelihood on at step {s0} (t={ts[s0]:.3f}); step size x{self.likelihood_step_factor:g} -> "
+                    f"{np.array2string(np.asarray(step_size), precision=3)}, warmup-rate adaptation for {self.rewarm_chunks} chunks"
+                )
                 ev_on = broaden_fn(float(ts[s0])) * jj_dev
-                ll_on = np.array([float(log_lik(target.denoise(positions[c], float(ts[s0])), ev_on)) for c in range(C)])
-                log(f"  log likelihood of the prior-settled states: {np.array2string(ll_on, precision=4)}")
+                ll_on = np.array(
+                    [
+                        float(log_lik(target.denoise(positions[c], float(ts[s0])), ev_on))
+                        for c in range(C)
+                    ]
+                )
+                log(
+                    f"  log likelihood of the prior-settled states: {np.array2string(ll_on, precision=4)}"
+                )
                 if not np.all(np.isfinite(ll_on)):
-                    log("  WARNING: non-finite likelihood at the switch; the prior-only phase carried the scene out of the "
-                        "likelihood's range (float32 exp overflow) and the chain cannot recover from here")
+                    log(
+                        "  WARNING: non-finite likelihood at the switch; the prior-only phase carried the scene out of the "
+                        "likelihood's range (float32 exp overflow) and the chain cannot recover from here"
+                    )
             lik_on = on_now
             if s0 == self.warmup_steps + self.anneal_steps and self.hold_steps > 0:
                 step_size = step_size * self.hold_step_factor
                 step_size_nuis = step_size_nuis * self.hold_step_factor
-                log(f"hold starts: step size x{self.hold_step_factor:g} -> {np.array2string(np.asarray(step_size), precision=3)}"
-                    + (f", non-scene {np.array2string(np.asarray(step_size_nuis), precision=3)}" if nuis_on else ""))
+                log(
+                    f"hold starts: step size x{self.hold_step_factor:g} -> {np.array2string(np.asarray(step_size), precision=3)}"
+                    + (
+                        f", non-scene {np.array2string(np.asarray(step_size_nuis), precision=3)}"
+                        if nuis_on
+                        else ""
+                    )
+                )
 
             # Block releases. Once the schedule reaches a block's earliest time its
             # curvature is probed (every release_probe_every chunks); it is
@@ -1035,18 +1238,28 @@ class Novamac:
                 if b.released_chunk is not None or t_chunk > b.t_earliest or not lik_on:
                     continue  # (nothing is released while the likelihood is off)
                 forced = t_chunk <= b.t_latest
-                due = b.last_probe_chunk is None or ci - b.last_probe_chunk >= self.release_probe_every
+                due = (
+                    b.last_probe_chunk is None
+                    or ci - b.last_probe_chunk >= self.release_probe_every
+                )
                 if not (forced or due):
                     continue
                 with Timer(f"release curvature {b.name}", timings, quiet=True) as tc:
                     curvature = np.mean(
-                        [np.asarray(curvature_fns[b.name](positions[c], float(ts[s0]), jj_dev)) for c in range(C)],
+                        [
+                            np.asarray(curvature_fns[b.name](positions[c], float(ts[s0]), jj_dev))
+                            for c in range(C)
+                        ],
                         axis=0,
                     )
                 b.last_probe_chunk = ci
                 var = release_inverse_mass(curvature, reference_var[b.idx])
                 constrained = curvature > 0
-                ratio = float(np.median(var[constrained]) / np.median(reference_var[b.idx])) if constrained.any() else np.inf
+                ratio = (
+                    float(np.median(var[constrained]) / np.median(reference_var[b.idx]))
+                    if constrained.any()
+                    else np.inf
+                )
                 trace["probe_block"].append(bi)
                 trace["probe_step"].append(s0)
                 trace["probe_ratio"].append(ratio)
@@ -1059,10 +1272,18 @@ class Novamac:
                     b.released_chunk = ci
                     trace["block_release_step"][bi] = s0
                     trace["block_release_t"][bi] = ts[s0]
-                    t_release[b.idx[~flat[b.idx]]] = ts[s0]  # active from this chunk on (template fluxes stay frozen)
-                    why = "latest time reached" if forced and ratio >= self.release_mass_ratio else "criterion met"
+                    t_release[b.idx[~flat[b.idx]]] = ts[
+                        s0
+                    ]  # active from this chunk on (template fluxes stay frozen)
+                    why = (
+                        "latest time reached"
+                        if forced and ratio >= self.release_mass_ratio
+                        else "criterion met"
+                    )
                     if log_prior_nuisance is not None:
-                        rewarm_nuis_until = ci + self.rewarm_chunks  # re-tune the non-scene step quickly after every release
+                        rewarm_nuis_until = (
+                            ci + self.rewarm_chunks
+                        )  # re-tune the non-scene step quickly after every release
                         nuis_on = True
                         step_size_nuis = step_size_nuis * self.release_step_factor
                         cut = f"non-scene step size x{self.release_step_factor:g} -> {np.array2string(np.asarray(step_size_nuis), precision=3)}"
@@ -1093,38 +1314,59 @@ class Novamac:
                 if active.any():
                     rng, key = jax.random.split(rng)
                     with Timer("linear gibbs", timings, quiet=True):
-                        positions, g_acc, c_mean, c_cov = gibbs_fn(jax.random.split(key, C), positions, t_chunk, jj_dev, as_dev(active))
+                        positions, g_acc, c_mean, c_cov = gibbs_fn(
+                            jax.random.split(key, C), positions, t_chunk, jj_dev, as_dev(active)
+                        )
                         jax.block_until_ready(positions)
                     gibbs_acc = np.asarray(g_acc)
                     trace["gibbs_accept"][ci] = gibbs_acc
                     trace["cond_mean"][ci] = np.asarray(c_mean)
                     trace["cond_cov"][ci] = np.asarray(c_cov)
 
-            # Diagnostics at the end of the chunk, with the parameters used in it
+            # Diagnostics at the end of the chunk, with the parameters used in it;
+            # the log density is that of the state the chunk ends on (after the
+            # Gibbs refresh), which is what the restart check below compares
             with Timer("scores", timings, quiet=True):
-                scores = np.asarray(score_fn(positions, t_chunk, jj_dev, as_dev(inv_mass_at(t_chunk))))
+                scores, logp_post = score_fns[lik_on](
+                    positions, t_chunk, jj_dev, as_dev(inv_mass_at(t_chunk))
+                )
+                scores, logp_end = np.asarray(scores), np.asarray(logp_post)
             trace["scores"][ci] = scores
+            trace["chunk_logdensity"][ci] = logp_end
             trace["step_size"][ci] = step_size
 
-            # Step size adaptation for the next chunk
+            # Step size adaptation for the next chunk (until the draws start)
             acceptance = np.asarray(ctrace["accept_prob"]).mean(axis=1)
-            warming = s1 <= self.warmup_steps or ci < rewarm_until
-            step_size = adapt_step_size(
-                step_size, acceptance, self.target_acceptance, self.acceptance_tol,
-                self.step_down_warmup if warming else self.step_down, self.step_up_warmup if warming else self.step_up,
-            )  # fmt: skip
-            acceptance_nuis = np.nanmean(np.asarray(ctrace["accept_prob_nuis"]), axis=1) if nuis_on else None
-            if nuis_on:
-                warming_nuis = s1 <= self.warmup_steps or ci < rewarm_nuis_until
-                step_size_nuis = adapt_step_size(
-                    step_size_nuis, acceptance_nuis, self.target_acceptance, self.acceptance_tol,
-                    self.step_down_warmup if warming_nuis else self.step_down, self.step_up_warmup if warming_nuis else self.step_up,
+            acceptance_nuis = (
+                np.nanmean(np.asarray(ctrace["accept_prob_nuis"]), axis=1) if nuis_on else None
+            )
+            adapting = s1 < draws_from
+            if adapting:
+                warming = s1 <= self.warmup_steps or ci < rewarm_until
+                step_size = adapt_step_size(
+                    step_size, acceptance, self.target_acceptance, self.acceptance_tol,
+                    self.step_down_warmup if warming else self.step_down, self.step_up_warmup if warming else self.step_up,
                 )  # fmt: skip
+                if nuis_on:
+                    warming_nuis = s1 <= self.warmup_steps or ci < rewarm_nuis_until
+                    step_size_nuis = adapt_step_size(
+                        step_size_nuis, acceptance_nuis, self.target_acceptance, self.acceptance_tol,
+                        self.step_down_warmup if warming_nuis else self.step_down, self.step_up_warmup if warming_nuis else self.step_up,
+                    )  # fmt: skip
             trace["step_size_nuis"][ci] = step_size_nuis if nuis_on else np.nan
+            if s1 == draws_from:
+                log(
+                    f"step sizes frozen at step {s1}: {np.array2string(np.asarray(step_size), precision=3)}"
+                    + (
+                        f", non-scene {np.array2string(np.asarray(step_size_nuis), precision=3)}"
+                        if nuis_on
+                        else ""
+                    )
+                    + "; no more adaptation or restarts, the states saved from here on are the posterior draws"
+                )
 
-            # Stalled chains restart from the healthiest chain
-            if self.restart_collapsed_chains and C > 1 and ci >= 1:
-                logp_end = np.asarray(ctrace["logdensity"])[:, -1]
+            # Stalled chains restart from the healthiest chain (until the draws start)
+            if self.restart_collapsed_chains and C > 1 and ci >= 1 and adapting:
                 flags = {
                     "collapsed": step_size < self.restart_step_ratio * float(np.median(step_size)),
                     "dead": acceptance < self.restart_dead_acceptance,
@@ -1133,8 +1375,13 @@ class Novamac:
                 if C > 2:
                     for c in range(C):
                         others = np.delete(logp_end, c)
-                        spread = max(float(np.max(others) - np.min(others)), self.restart_outlier_min)
-                        flags["outlier"][c] = abs(logp_end[c] - float(np.median(others))) > self.restart_outlier_factor * spread
+                        spread = max(
+                            float(np.max(others) - np.min(others)), self.restart_outlier_min
+                        )
+                        flags["outlier"][c] = (
+                            abs(logp_end[c] - float(np.median(others)))
+                            > self.restart_outlier_factor * spread
+                        )
                 for nm_, flag in flags.items():
                     stall_chunks[nm_] = np.where(flag, stall_chunks[nm_] + 1, 0)
                 stalled = np.zeros(C, dtype=bool)
@@ -1158,8 +1405,10 @@ class Novamac:
                         trace["restart_source"].append(best)
                         trace["restart_reason"].append(",".join(reasons[int(c)]))
                     why = "; ".join(f"chain {int(c)}: {'+'.join(reasons[int(c)])}" for c in bad)
-                    log(f"stalled for {self.restart_chunks} chunks ({why}): restarted from chain {best}'s state and step sizes "
-                        f"at step {s1} [{self.phase_of(s1)}]")
+                    log(
+                        f"stalled for {self.restart_chunks} chunks ({why}): restarted from chain {best}'s state and step sizes "
+                        f"at step {s1} [{self.phase_of(s1)}]"
+                    )
 
             # Save model states
             if s1 % self.save_every == 0 or s1 == total:
@@ -1171,7 +1420,10 @@ class Novamac:
                     save_tweedie(ts[s1 - 1])
 
             # Report
-            lik_over_prior = scores[:, SCORE_FIELDS.index("lik_mnorm_scene")] / scores[:, SCORE_FIELDS.index("prior_mnorm_scene")]
+            lik_over_prior = (
+                scores[:, SCORE_FIELDS.index("lik_mnorm_scene")]
+                / scores[:, SCORE_FIELDS.index("prior_mnorm_scene")]
+            )
             n_div = int(np.asarray(ctrace["divergent"]).sum())
             pred = np.asarray(ctrace["predictor_rms"]).mean(axis=1)
             fmt = lambda a: np.array2string(np.asarray(a), precision=3)  # noqa: E731
@@ -1180,7 +1432,11 @@ class Novamac:
                 f"acc {fmt(acceptance)} | eps {fmt(step_size)} | pred rms {fmt(pred)} | "
                 f"logp {fmt(np.asarray(ctrace['logdensity'])[:, -1])} | "
                 f"div {n_div} | scene score lik/prior {fmt(lik_over_prior)}"
-                + (f" | nuis acc {fmt(acceptance_nuis)} eps {fmt(step_size_nuis)}" if nuis_on else "")
+                + (
+                    f" | nuis acc {fmt(acceptance_nuis)} eps {fmt(step_size_nuis)}"
+                    if nuis_on
+                    else ""
+                )
                 + (f" | gibbs acc {fmt(gibbs_acc)}" if gibbs_acc is not None else "")
             )
             if not np.all(np.isfinite(np.asarray(ctrace["logdensity"]))):

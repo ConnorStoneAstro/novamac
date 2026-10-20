@@ -236,8 +236,9 @@ def aperture_fluxes(residual, weight, mask, crpix, crtan, CD, position, psf_n, p
     pixels, so a sharp PSF still gets a few pixels), corrected by the
     fraction of a circular Moffat enclosed in that radius. psf_Rd is in
     pixels, as AstroPhot's PSF models have it. Returns (flux, error) with
-    the error from the weights (1 / variance; 0 on masked pixels), so an
-    epoch without a detection is consistent with zero within its error.
+    the error from the weights (1 / variance). Pixels the likelihood ignores
+    (masked, or with zero / non-finite weight) are left out, so an epoch
+    without a detection is consistent with zero within its error.
     """
     residual = np.asarray(residual, dtype=float)
     weight = np.asarray(weight, dtype=float)
@@ -251,7 +252,8 @@ def aperture_fluxes(residual, weight, mask, crpix, crtan, CD, position, psf_n, p
     for n in range(N):
         fwhm = float(moffat_fwhm(psf_n[n], psf_Rd[n]))  # pixels
         r_pix = max(radius_factor * fwhm, min_radius)
-        inside = ((cols - pos[n, 0]) ** 2 + (rows - pos[n, 1]) ** 2 <= r_pix**2) & ~mask[n] & np.isfinite(residual[n])
+        usable = ~mask[n] & np.isfinite(residual[n]) & np.isfinite(weight[n]) & (weight[n] > 0)  # as the likelihood counts them
+        inside = ((cols - pos[n, 0]) ** 2 + (rows - pos[n, 1]) ** 2 <= r_pix**2) & usable
         if not inside.any():
             continue
         enclosed = float(moffat_enclosed(r_pix, psf_n[n], psf_Rd[n]))

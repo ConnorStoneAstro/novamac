@@ -156,20 +156,45 @@ def collect_fluxes(files: RunFiles, n_chains: int):
     return np.stack([f[:n_saved] for f in fluxes])
 
 
-def conditional_fluxes(trace):
+def draw_states(trace):
+    """Which saved states are posterior draws: those saved once every kernel
+    was fixed (step >= draws_from_step; for an older trace, the t = 0 states)."""
+    saved_step = np.asarray(trace["saved_step"])
+    if "draws_from_step" in trace:
+        return saved_step >= int(trace["draws_from_step"])
+    return np.asarray(trace["saved_t"]) == 0
+
+
+def summarize_draws(fluxes, trace):
+    """Mean and standard deviation of the point-source fluxes over the
+    posterior draws (chains x draw states): (P, N) each, or None without
+    any draw. `fluxes` is collect_fluxes' (chains, saved, P, N)."""
+    draws = draw_states(trace)[: fluxes.shape[1]]
+    if not draws.any():
+        return None
+    f = fluxes[:, draws].reshape(-1, *fluxes.shape[2:])
+    return f.mean(axis=0), f.std(axis=0), f.shape[0]
+
+
+def proposal_flux_moments(trace):
     """
-    Rao-Blackwellised flux estimate from the linear Gibbs conditionals stored
-    at the end of every chunk of the hold phase (t = 0): for each source p a
-    dict image -> (mean, std) where the mean averages the conditional means
-    over chains and hold chunks, and the variance is the average conditional
-    variance plus the spread of the conditional means across those states
-    (law of total variance). None if the run stored no conditionals or has
-    no hold chunk yet.
+    The linear Gibbs proposal's moments of the point-source fluxes, averaged
+    over the chunks of the draw phase: for each source p a dict
+    image -> (mean, std) where the mean averages the proposal means over
+    chains and chunks, and the variance is the average proposal variance
+    plus the spread of the means across those states. These are the
+    LIKELIHOOD's conditional moments of the physical flux given the rest of
+    the state, before the log-flux prior, its Jacobian and the positivity
+    constraint, so they are not posterior moments (a faint epoch can have a
+    negative mean); use summarize_draws for the posterior. None if the run
+    stored no proposals or has no draw chunk yet.
     """
     if "cond_mean" not in trace:
         return None
     n_chunks = int(np.sum(trace["chunk_step"] <= int(trace["steps_done"])))
-    hold = np.where((trace["chunk_t"][:n_chunks] == 0) & np.all(np.isfinite(trace["cond_mean"][:n_chunks]), axis=(1, 2)))[0]
+    draws_from = int(trace["draws_from_step"]) if "draws_from_step" in trace else None
+    in_draws = trace["chunk_step"][:n_chunks] >= draws_from if draws_from is not None else trace["chunk_t"][:n_chunks] == 0
+    hold = np.where(in_draws & np.all(np.isfinite(trace["cond_mean"][:n_chunks]), axis=(1, 2)))[0]
     if len(hold) == 0:
         return None
     means = trace["cond_mean"][hold].astype(np.float64)  # (S, C, K)

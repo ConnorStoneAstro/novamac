@@ -45,6 +45,16 @@ def test_posterior_run_plots_and_diagnostics(tmp_path, prior_dir, synthetic):
     assert np.any(np.isfinite(trace["gibbs_accept"])), "Gibbs refresh ran"
     assert "prior_offset_value" in trace
     assert "settings" in trace
+    # the draw phase: kernels fixed after hold_adapt_chunks chunks of the hold, no restarts after that
+    s = FAST_SETTINGS
+    hold_start = s["warmup_steps"] + s["anneal_steps"]
+    expected = min(int(trace["steps_done"]), hold_start + Novamac.hold_adapt_chunks * s["chunk_steps"])
+    assert int(trace["draws_from_step"]) == expected
+    n_chunks = len(trace["chunk_step"])
+    frozen = trace["chunk_step"] >= expected
+    assert np.all(trace["step_size"][n_chunks - 1] == trace["step_size"][np.argmax(frozen)]) if frozen.any() else True
+    assert all(int(st) <= expected for st in trace["restart_step"])
+    assert np.all(np.isfinite(trace["chunk_logdensity"]))
 
     paths = nm.plot_all(raise_errors=True)
     for what in FIGURES:

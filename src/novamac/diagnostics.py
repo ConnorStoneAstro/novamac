@@ -21,6 +21,8 @@ wrong, for use at scale when a run misbehaves:
                       (which block limits the step size).
 """
 
+import json
+
 import caskade as ck
 import h5py
 import jax
@@ -28,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._backend import DTYPE, MATMUL_PRECISION
-from .hmc import make_broadening_fn, make_chunk_runner, make_log_parts, make_sigma_fn, make_target
+from .hmc import make_broadening_fn, make_chunk_runner, make_log_parts, make_log_variance_fn, make_sigma_fn, make_target
 from .products import load_chain_state, num_saved_states, read_scene_history
 from .sampler import calibrate_prior_offset, parameter_blocks
 from .utils import log
@@ -143,9 +145,14 @@ def diagnose_stall(nm, n_last=4):
         calibrate_prior_offset(model, np.asarray(x_init)[trace["scene_idx"]].reshape(pix.I.shape), jax.random.key(123), len(trace["prior_offset_sigma"]))
         out("prior energy offset installed (as in the sampler)")
     log_lik, log_prior, _ = make_log_parts(model, group1)
-    if not bool(trace.get("likelihood", True)) or np.all(np.nan_to_num(trace["loglik"][: int(trace["steps_done"])]) == 0):
+    settings = json.loads(str(trace["settings"])) if "settings" in trace else {}
+    if not settings.get("likelihood", True):
         log_lik = jax.jit(lambda x, extra_var: jnp.zeros((), dtype=x.dtype))
-    target = make_target(log_lik, log_prior, sigma_fn, jnp.asarray(scene_mask, DTYPE), tweedie, nm.tweedie_exact_jacobian)
+    # the target exactly as the sampler built it: Tweedie, the mean correction and the Jacobian choice
+    log_var_fn = make_log_variance_fn(sde, float(data_std) if tweedie else None) if bool(trace.get("mean_correction", False)) else None
+    target = make_target(log_lik, log_prior, sigma_fn, jnp.asarray(scene_mask, DTYPE), tweedie,
+                         bool(settings.get("tweedie_exact_jacobian", nm.tweedie_exact_jacobian)), log_var_fn)  # fmt: skip
+    out(f"target: tweedie {tweedie}, mean correction {log_var_fn is not None}, likelihood {settings.get('likelihood', True)}")
     finals = []
     for c in range(C):
         with h5py.File(nm.files.chain(c), "r") as h5:
@@ -165,11 +172,11 @@ def diagnose_stall(nm, n_last=4):
         + ("" if len(stalled) else " (no window with acceptance < 0.1: using the last two)"))
     out(f"final state of chain 0 (last chunk t={t_stall:.4f}, previous {t_before:.4f}); sigma_min={sde.sigma_min:.4g}")
     out(f"{'t':>8} {'sigma':>9} {'log L':>14} {'log prior':>14} {'|grad L|':>10} {'|grad p|':>10} {'|grad p| scene':>14} {'finite':>7}")
+    out("  (the target's own parts: the likelihood on the scene it sees at that t, its force, and the prior score)")
     for t in sorted({0.02, 0.01, t_before, t_stall * 0.5 + t_before * 0.5, t_stall, 0.001, 0.0}, reverse=True):
         t = float(t)
         ev = broaden_fn(t) * jj
-        ll, gl = jax.value_and_grad(log_lik)(x, ev)
-        lp, gp = jax.value_and_grad(log_prior)(x, t)
+        ll, lp, gl, gp = target.parts(x, t, ev)
         finite = bool(jnp.isfinite(ll) & jnp.isfinite(lp) & jnp.all(jnp.isfinite(gl)) & jnp.all(jnp.isfinite(gp)))
         out(f"{t:8.4f} {float(sigma_fn(t)):9.4g} {float(ll):14.6g} {float(lp):14.6g} {float(jnp.linalg.norm(gl)):10.3g} {float(jnp.linalg.norm(gp)):10.3g} {float(jnp.linalg.norm(gp[scene])):14.3g} {str(finite):>7}")
 

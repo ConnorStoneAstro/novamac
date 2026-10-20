@@ -128,6 +128,7 @@ def flat_data_weight(model):
     variance = np.asarray(target.flatten("variance"), dtype=np.float64)
     mask = np.asarray(target.flatten("mask"), dtype=bool)
     weight = np.where(mask | ~np.isfinite(variance) | (variance <= 0), 0.0, 1.0 / np.where(variance > 0, variance, 1.0))
+    data = np.where(weight > 0, data, 0.0)  # a nan under the mask must not reach a matrix product (0 * nan = nan)
     return data, weight
 
 
