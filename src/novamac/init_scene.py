@@ -206,7 +206,8 @@ def prior_transform(scene, scene_scale, softening, prior_scene_factor=1.0):
 
 
 def moffat_fwhm(n, Rd):
-    """FWHM of a Moffat profile with index n and scale radius Rd."""
+    """FWHM of a Moffat profile with index n and scale radius Rd (same units as Rd;
+    AstroPhot's PSF Rd is in pixels of the image the PSF belongs to)."""
     return 2.0 * np.asarray(Rd, dtype=float) * np.sqrt(2.0 ** (1.0 / np.asarray(n, dtype=float)) - 1.0)
 
 
@@ -226,13 +227,15 @@ def source_pixel_position(crpix, crtan, CD, position):
     return out
 
 
-def aperture_fluxes(residual, weight, mask, crpix, crtan, CD, position, psf_n, psf_Rd, radius_factor=1.5):
+def aperture_fluxes(residual, weight, mask, crpix, crtan, CD, position, psf_n, psf_Rd, radius_factor=1.5, min_radius=2.5):
     """
     Aperture flux of a point source at tangent-plane `position` in every
     image of `residual` (data with the static scene and sky removed), in the
     data's flux units: the sum of the unmasked pixels within
-    radius_factor x the Moffat FWHM of the source, corrected by the fraction
-    of a circular Moffat enclosed in that radius. Returns (flux, error) with
+    radius_factor x the Moffat FWHM of the source (at least `min_radius`
+    pixels, so a sharp PSF still gets a few pixels), corrected by the
+    fraction of a circular Moffat enclosed in that radius. psf_Rd is in
+    pixels, as AstroPhot's PSF models have it. Returns (flux, error) with
     the error from the weights (1 / variance; 0 on masked pixels), so an
     epoch without a detection is consistent with zero within its error.
     """
@@ -246,13 +249,12 @@ def aperture_fluxes(residual, weight, mask, crpix, crtan, CD, position, psf_n, p
     flux = np.zeros(N)
     err = np.zeros(N)
     for n in range(N):
-        pix = np.sqrt(abs(np.linalg.det(CD[n])))
-        fwhm = float(moffat_fwhm(psf_n[n], psf_Rd[n]))  # arcsec
-        r_pix = radius_factor * fwhm / pix
+        fwhm = float(moffat_fwhm(psf_n[n], psf_Rd[n]))  # pixels
+        r_pix = max(radius_factor * fwhm, min_radius)
         inside = ((cols - pos[n, 0]) ** 2 + (rows - pos[n, 1]) ** 2 <= r_pix**2) & ~mask[n] & np.isfinite(residual[n])
         if not inside.any():
             continue
-        enclosed = float(moffat_enclosed(radius_factor * fwhm, psf_n[n], psf_Rd[n]))
+        enclosed = float(moffat_enclosed(r_pix, psf_n[n], psf_Rd[n]))
         flux[n] = residual[n][inside].sum() / enclosed
         w = weight[n][inside]
         var = np.where(w > 0, 1.0 / np.where(w > 0, w, 1.0), 0.0)

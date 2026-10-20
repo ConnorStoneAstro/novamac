@@ -175,7 +175,7 @@ def test_source_pixel_position_inverts_wcs():
 def test_aperture_fluxes_recover_a_moffat():
     """A circular Moffat of known flux, sampled analytically into pixels."""
     N, H, W, pix = 3, 41, 41, 0.25
-    n, Rd = 3.0, 0.8
+    n, Rd = 3.0, 3.2  # Rd in pixels, as AstroPhot's PSF models have it
     flux_true = np.array([500.0, 0.0, 120.0])
     rng = np.random.default_rng(5)
     crpix = np.full((N, 2), 20.0) + rng.uniform(-2, 2, (N, 2))
@@ -186,8 +186,8 @@ def test_aperture_fluxes_recover_a_moffat():
     rows, cols = np.mgrid[:H, :W]
     data = np.zeros((N, H, W))
     for i in range(N):
-        r = np.hypot(cols - ppix[i, 0], rows - ppix[i, 1]) * pix
-        profile = (n - 1) / (np.pi * Rd**2) * (1 + (r / Rd) ** 2) ** (-n) * pix**2
+        r = np.hypot(cols - ppix[i, 0], rows - ppix[i, 1])  # pixels
+        profile = (n - 1) / (np.pi * Rd**2) * (1 + (r / Rd) ** 2) ** (-n)  # per pixel
         data[i] = flux_true[i] * profile + rng.normal(0, 0.05, (H, W))
     flux, err = aperture_fluxes(data, np.full(data.shape, 400.0), np.zeros(data.shape, bool), crpix, crtan, CD, pos,
                                 np.full(N, n), np.full(N, Rd), radius_factor=1.5)  # fmt: skip

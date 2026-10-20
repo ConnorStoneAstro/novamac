@@ -318,7 +318,7 @@ def plot_parameter_traces(nm, trace=None):
     _trace_panel(axes[0], saved_step, scale, n_chains, trace, "scene scale (model = scale x I)")
     _trace_panel(axes[1], saved_step, sky, n_chains, trace, "sky level [data units / arcsec^2]")
     _trace_panel(axes[2], saved_step, psf["n"], n_chains, trace, "PSF n")
-    _trace_panel(axes[3], saved_step, psf["Rd"], n_chains, trace, "PSF Rd [arcsec]")
+    _trace_panel(axes[3], saved_step, psf["Rd"], n_chains, trace, "PSF Rd [data px]")
     _trace_panel(axes[4], saved_step, psf["q"], n_chains, trace, "PSF q")
     _trace_panel(axes[5], saved_step, psf["PA"], n_chains, trace, "PSF PA [rad]")
     axes[0].set_title(f"{nm.name}: scene scale, per-image sky and PSF traces (one line per image)")

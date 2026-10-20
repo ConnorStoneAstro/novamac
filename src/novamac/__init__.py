@@ -17,11 +17,14 @@ from .utils import get_fluxes, log, enable_console_logging
 from . import host_prior
 from . import init_scene, hmc, products, plots, diagnostics
 from .inference import Novamac
+from .psf import fit_moffat_psf, fit_moffat_psfs
 
 _backend.configure()  # after AstroPhot (which turns x64 on at import)
 
 __all__ = (
     "Novamac",
+    "fit_moffat_psf",
+    "fit_moffat_psfs",
     "build_likelihood",
     "build_prior",
     "build_posterior",

@@ -26,6 +26,12 @@ nm.sample()      # writes chain files, trace, Tweedie estimates, timings to out_
 nm.plot_all()    # every diagnostic figure, from the products on disk
 ```
 
+PSF calibrations usually come as images rather than Moffat parameters:
+`fit_moffat_psfs(psf_images)` fits AstroPhot's elliptical Moffat PSF model
+to each (`novamac.psf`) and returns the four parameter arrays, or pass
+`psf_images=` to `Novamac` directly. Rd is in pixels of the data, as
+AstroPhot's PSF models have it.
+
 Everything the inference needs is given at construction; reading a
 particular survey's data and preparing it (cutting cutouts, calibrations,
 units) stays outside the package. Optional inputs are estimated from the data

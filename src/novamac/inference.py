@@ -76,6 +76,7 @@ from .hmc import (
 )
 from .host_prior import Prior, load_prior
 from .init_scene import aperture_fluxes, border_sky, cd_arcsec, data_pixel_scale, prepare_initial_scene
+from .psf import fit_moffat_psfs
 from .products import RunFiles
 from .sampler import (
     build_schedule,
@@ -337,17 +338,18 @@ class Novamac:
         crtan,
         crval,
         CD,
-        psf_n,
-        psf_Rd,
-        psf_q,
-        psf_PA,
         zeropoint,
         ps_center,
         prior,
+        psf_n=None,
+        psf_Rd=None,
+        psf_q=None,
+        psf_PA=None,
+        psf_images=None,
         weight=None,
         variance=None,
         mask=None,
-        psf_shape=(15, 15),
+        psf_shape=None,
         psf_upsample=1,
         ps_flux=None,
         sky=None,
@@ -376,8 +378,11 @@ class Novamac:
                                     tangent-plane position (arcsec), the tangent
                                     point (world coords) and the pixel matrix
                                     (arcsec or degrees per pixel)
-          psf_n, psf_Rd, psf_q, psf_PA (N,)  Moffat PSF per image (Rd in arcsec, PA in rad)
-          psf_shape, psf_upsample   footprint of the rendered PSF in data pixels and its oversampling
+          psf_n, psf_Rd, psf_q, psf_PA (N,)  Moffat PSF per image (Rd in data pixels, PA in rad), or
+          psf_images (N, h, w)      PSF images instead, fitted with the Moffat model (novamac.psf)
+          psf_shape, psf_upsample   footprint of the rendered PSF in data pixels (default: the PSF
+                                    images' size, else 15 x 15) and the oversampling of the PSF
+                                    (images and model alike)
           zeropoint                 AB zero point of the data: 1 data unit = 10^((8.90 - zp) / 2.5) Jy
           ps_center (P, 2)          initial tangent-plane position of the point source(s), arcsec
           prior                     host prior checkpoint directory, or a loaded host_prior.Prior
@@ -425,9 +430,23 @@ class Novamac:
         self.crtan = np.asarray(crtan, dtype=float)
         self.crval = np.asarray(crval, dtype=float)
         self.CD = np.asarray(CD, dtype=float)
-        self.psf_n, self.psf_Rd, self.psf_q, self.psf_PA = (np.asarray(a, dtype=float) for a in (psf_n, psf_Rd, psf_q, psf_PA))
-        self.psf_shape = tuple(int(s) for s in psf_shape)
         self.psf_upsample = int(psf_upsample)
+        given = [a is not None for a in (psf_n, psf_Rd, psf_q, psf_PA)]
+        if psf_images is not None:
+            if any(given):
+                raise ValueError("give either psf_images or the Moffat parameters psf_n, psf_Rd, psf_q, psf_PA, not both")
+            psf_images = [np.asarray(im, dtype=float) for im in psf_images]
+            if len(psf_images) != self.data.shape[0]:
+                raise ValueError("psf_images must have one image per epoch")
+            fitted = fit_moffat_psfs(psf_images, upsample=self.psf_upsample)
+            psf_n, psf_Rd, psf_q, psf_PA = (fitted[k] for k in ("psf_n", "psf_Rd", "psf_q", "psf_PA"))
+            if psf_shape is None:
+                h, w = psf_images[0].shape
+                psf_shape = (h // self.psf_upsample, w // self.psf_upsample)
+        elif not all(given):
+            raise ValueError("give the Moffat PSF parameters psf_n, psf_Rd, psf_q, psf_PA (all four) or psf_images")
+        self.psf_n, self.psf_Rd, self.psf_q, self.psf_PA = (np.asarray(a, dtype=float) for a in (psf_n, psf_Rd, psf_q, psf_PA))
+        self.psf_shape = (15, 15) if psf_shape is None else tuple(int(s) for s in psf_shape)
         self.zeropoint = float(zeropoint)
         self.ps_center = np.asarray(ps_center, dtype=float)
         if self.ps_center.shape == (2,):
