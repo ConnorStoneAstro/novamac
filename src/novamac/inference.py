@@ -58,6 +58,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._backend import DTYPE
+from .align import refine_alignment
 from .build_likelihood import build_likelihood
 from .build_prior import build_prior
 from .hmc import (
@@ -83,7 +84,10 @@ from .init_scene import (
     border_sky,
     cd_arcsec,
     data_pixel_scale,
+    moffat_fwhm,
     prepare_initial_scene,
+    source_pixel_position,
+    stack_templates,
 )
 from .psf import fit_moffat_psfs
 from .products import RunFiles
@@ -331,6 +335,20 @@ class Novamac:
     # Aperture for the initial point-source fluxes when none are given:
     # radius in units of the Moffat FWHM (the enclosed fraction is corrected).
     init_aperture_fwhm = 1.5
+    # Initial alignment (align.py): once the initial scene and fluxes exist,
+    # each image's crtan takes init_align_steps Adam steps of init_align_rate
+    # data pixels on its chi-square, clipped to +-init_align_max_shift data
+    # pixels of the input WCS, and keeps the shift only if its chi-square
+    # decreased by at least init_align_min_dchi2 (6: a 95% improvement for two
+    # offsets, so noise is not chased); the initial scene is then stacked
+    # again with the refined offsets. Removes gross misalignment only: the
+    # alignment prior stays centred on the input WCS and the sampler finds
+    # the rest.
+    init_align = True
+    init_align_steps = 100
+    init_align_rate = 0.05
+    init_align_max_shift = 1.0
+    init_align_min_dchi2 = 6.0
 
     # Prior configuration (build_prior). prior_scene_factor: the host prior is
     # shown the scene this many times brighter than the likelihood renders it
@@ -548,6 +566,8 @@ class Novamac:
 
         self.likelihood_args = None  # built by prepare()
         self.init_info = None
+        self.crtan_init = None  # the images' starting offsets (the input crtan, refined by init_align)
+        self.align_info = None
         self.model = None  # built by build_model()
         self.trace = None  # the last sample() call's trace
 
@@ -584,19 +604,13 @@ class Novamac:
         rendered scene). Idempotent."""
         if self.likelihood_args is not None:
             return self
-        border = (
-            border_sky(self.data, self.mask, self.init_sky_border) if self.init_sky_border else None
-        )
+        self._border = border_sky(self.data, self.mask, self.init_sky_border) if self.init_sky_border else None
         if self.sky is None:
             # the model's sky is a surface brightness (flux per arcsec^2)
             area = np.abs(np.linalg.det(cd_arcsec(self.CD)))
-            self.sky = np.zeros(self.n_images) if border is None else border / area
-        scene, info = prepare_initial_scene(
-            self.data, self.weight, self.mask, self.is_template, self.crpix, self.crtan, self.CD, self.scene_shape,
-            self.scene_pixel_scale, self.ps_center[0], scene_scale=self.scene_scale0, softening=self.prior.transform.softening,
-            prior_scene_factor=self.prior_scene_factor, init_image=self.init_image, sky=border,
-            threshold_sigma=self.init_threshold_sigma, min_templates=self.init_min_templates, subsample=self.init_subsample,
-        )  # fmt: skip
+            self.sky = np.zeros(self.n_images) if self._border is None else self._border / area
+        self.crtan_init = self.crtan.copy()
+        scene, info = self._initial_scene(self.crtan)
         self.init_info = info
         self.likelihood_args = {
             "data": self.data, "var": None, "weight": self.weight, "mask": self.mask, "band": self.band,
@@ -609,10 +623,20 @@ class Novamac:
         }  # fmt: skip
         return self
 
+    def _initial_scene(self, crtan):
+        """The initial scene stacked with the given image offsets (init_scene.prepare_initial_scene)."""
+        return prepare_initial_scene(
+            self.data, self.weight, self.mask, self.is_template, self.crpix, crtan, self.CD, self.scene_shape,
+            self.scene_pixel_scale, self.ps_center[0], scene_scale=self.scene_scale0, softening=self.prior.transform.softening,
+            prior_scene_factor=self.prior_scene_factor, init_image=self.init_image, sky=self._border,
+            threshold_sigma=self.init_threshold_sigma, min_templates=self.init_min_templates, subsample=self.init_subsample,
+        )  # fmt: skip
+
     def build_model(self):
         """The AstroPhot model (likelihood + prior), built once and cached.
         Every plot and diagnostic uses the same build, so the parameter
-        layout matches the chain files."""
+        layout matches the chain files. Estimates the initial fluxes and
+        refines the initial alignment (init_align) on the way when asked."""
         if self.model is not None:
             return self.model
         self.prepare()
@@ -627,6 +651,28 @@ class Novamac:
             for p in range(self.n_sources):
                 model.models[f"ps_batch_model_{p}"].model.flux.allflux.value = self.ps_flux[p]
             model.meta.ps_flux0 = self.ps_flux
+        if self.init_align and self.likelihood and self.init_image is None:
+            # the raw stack is image-like (PSF-blurred): compare it to the data directly,
+            # outside the transient's aperture, not through the forward model
+            self.align_info = refine_alignment(
+                self._leave_one_out_stacks(self.crtan), self.data, self.weight, self.mask | self._transient_aperture(),
+                self.crpix, self.crtan, self.CD,
+                self.ps_center[0], self.scene_pixel_scale, sky=None if self._border is None else self._border,
+                max_shift=self.init_align_max_shift, steps=self.init_align_steps, rate=self.init_align_rate,
+                pixel_scale=self.data_pixel_scale, min_dchi2=self.init_align_min_dchi2,
+            )  # fmt: skip
+            self.init_info["report"].extend(self.align_info["report"])
+            if self.align_info["accepted"].any():
+                self.crtan_init = self.align_info["crtan"]
+                for n, target in enumerate(model.target.images):
+                    target.crtan.value = self.crtan_init[n]
+                # the stack again, with the refined offsets (sharper where the input WCS was off)
+                scene, info = self._initial_scene(self.crtan_init)
+                self.likelihood_args["pix_init"] = scene
+                info["report"] = self.init_info["report"] + ["restacked with the refined alignment: " + info["report"][0]]
+                self.init_info = info
+                model.models.pixelated_batch_model.model.I.value = scene / self.scene_scale0
+            # the alignment prior stays centred on the input WCS (model.meta.crtan0): only the start moved
         widths = dict(self.prior_widths)
         if widths.get("wcs") is None:
             widths["wcs"] = self.data_pixel_scale
@@ -635,6 +681,41 @@ class Novamac:
             **{f"{k}_prior_width": v for k, v in widths.items()},
         )  # fmt: skip
         return self.model
+
+    def _leave_one_out_stacks(self, crtan):
+        """(N, H, W) raw stacks for the alignment: for each template the stack
+        of the other templates (its own noise must not be in the scene it is
+        compared with), for each transient epoch the stack of all templates;
+        every image when there are too few templates (init_min_templates)."""
+        templates = np.where(self.is_template)[0]
+        full = self.init_info["raw"]
+        if len(templates) < max(self.init_min_templates, 2):
+            return np.broadcast_to(full, (self.n_images,) + full.shape)
+        out = np.empty((self.n_images,) + full.shape)
+        for n in range(self.n_images):
+            if not self.is_template[n]:
+                out[n] = full
+                continue
+            others = self.is_template.copy()
+            others[n] = False
+            out[n] = stack_templates(
+                self.data, self.weight, self.mask, others, self.crpix, crtan, self.CD, self.scene_shape, self.scene_pixel_scale,
+                self.ps_center[0], self._border, min_templates=1, subsample=self.init_subsample,
+            )[0]  # fmt: skip
+        return out
+
+    def _transient_aperture(self):
+        """(N, H, W) pixels within 2 FWHM (at least 3 px) of a point source in
+        the transient epochs: left out of the initial alignment."""
+        N, H, W = self.data.shape
+        rows, cols = np.mgrid[:H, :W]
+        out = np.zeros((N, H, W), dtype=bool)
+        for p in range(self.n_sources):
+            pos = source_pixel_position(self.crpix, self.crtan, self.CD, self.ps_center[p])
+            for n in np.where(~self.is_template)[0]:
+                r = max(2.0 * float(moffat_fwhm(self.psf_n[n], self.psf_Rd[n])), 3.0)
+                out[n] |= (cols - pos[n, 0]) ** 2 + (rows - pos[n, 1]) ** 2 <= r**2
+        return out
 
     def _estimate_fluxes(self, model):
         """Aperture photometry of the data minus the rendered initial scene

@@ -38,7 +38,10 @@ units) stays outside the package. Optional inputs are estimated from the data
 when not given: the initial scene (a WCS-based drizzled stack of the template
 epochs, `novamac.init_scene`), the per-image sky (border median) and the
 initial point-source fluxes (aperture photometry of the data minus the
-initial scene). Every sampler setting is a documented class attribute of
+initial scene). Each image's alignment then takes a bounded, fixed number
+of gradient steps against that scene (`novamac.align`; the alignment
+prior stays centred on the input WCS, so this only moves the start) and
+the scene is stacked again. Every sampler setting is a documented class attribute of
 `Novamac` (`Novamac.setting_names()`); pass any as a keyword to override per
 instance, or set it on the class for every instance.
 
