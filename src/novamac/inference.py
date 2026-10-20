@@ -177,14 +177,14 @@ class Novamac:
     # expectation be absorbed by one coordinate instead of by every scene
     # pixel. freeze_scene_scale keeps it at the unit conversion. It is always
     # frozen in the prior-only and frozen test modes, where nothing constrains it.
-    freeze_scene_scale = True
+    freeze_scene_scale = False
     release_t = {
-        "scene_scale": 0.4,  # the scene's overall scale factor: free from the start (if not frozen)
-        "sky": 0.4,
-        "alignment": 0.4,  # per-image crtan
-        "ps_flux": 0.3,
-        "ps_center": 0.3,
-        "psf": 0.3,
+        "scene_scale": 0.7,  # the scene's overall scale factor: free from the start (if not frozen)
+        "sky": 0.7,
+        "alignment": 0.7,  # per-image crtan
+        "ps_flux": 0.4,
+        "ps_center": 0.4,
+        "psf": 0.4,
     }
     # Blocks listed here are not released at release_t unconditionally: from
     # release_t on, their curvature is probed every release_probe_every chunks and
@@ -566,7 +566,9 @@ class Novamac:
 
         self.likelihood_args = None  # built by prepare()
         self.init_info = None
-        self.crtan_init = None  # the images' starting offsets (the input crtan, refined by init_align)
+        self.crtan_init = (
+            None  # the images' starting offsets (the input crtan, refined by init_align)
+        )
         self.align_info = None
         self.model = None  # built by build_model()
         self.trace = None  # the last sample() call's trace
@@ -604,7 +606,9 @@ class Novamac:
         rendered scene). Idempotent."""
         if self.likelihood_args is not None:
             return self
-        self._border = border_sky(self.data, self.mask, self.init_sky_border) if self.init_sky_border else None
+        self._border = (
+            border_sky(self.data, self.mask, self.init_sky_border) if self.init_sky_border else None
+        )
         if self.sky is None:
             # the model's sky is a surface brightness (flux per arcsec^2)
             area = np.abs(np.linalg.det(cd_arcsec(self.CD)))
@@ -669,7 +673,9 @@ class Novamac:
                 # the stack again, with the refined offsets (sharper where the input WCS was off)
                 scene, info = self._initial_scene(self.crtan_init)
                 self.likelihood_args["pix_init"] = scene
-                info["report"] = self.init_info["report"] + ["restacked with the refined alignment: " + info["report"][0]]
+                info["report"] = self.init_info["report"] + [
+                    "restacked with the refined alignment: " + info["report"][0]
+                ]
                 self.init_info = info
                 model.models.pixelated_batch_model.model.I.value = scene / self.scene_scale0
             # the alignment prior stays centred on the input WCS (model.meta.crtan0): only the start moved
