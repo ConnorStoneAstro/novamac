@@ -282,10 +282,10 @@ class Novamac:
     )
     target_acceptance = 0.6
     acceptance_tol = 0.05
-    step_down, step_up = 0.7, 1.3  # during annealing / hold
+    step_down, step_up = 0.5, 1.4  # during annealing / hold
     # Faster during warmup: the initial search happens far from the typical set
     # where gradients are large, so it starts tiny and must catch up quickly
-    step_down_warmup, step_up_warmup = 0.4, 1.6
+    step_down_warmup, step_up_warmup = 0.1, 1.8
 
     hutchinson_probes = 256  # for diag(J J^T); relative error ~ sqrt(2 / probes)
     hutchinson_batch = 32
