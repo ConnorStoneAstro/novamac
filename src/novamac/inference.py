@@ -124,8 +124,8 @@ class Novamac:
     # freezes. sigma ~ 1 (one e-fold of pixel noise) is broad but recoverable.
     sigma_start = 1.0
     warmup_steps = 256  # at t = t_start, HMC only
-    anneal_steps = 2048  # t from t_start down to 0, predictor + corrector
-    hold_steps = 256  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
+    anneal_steps = 4096  # t from t_start down to 0, predictor + corrector
+    hold_steps = 512  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
     # The step sizes keep adapting for this many chunks of the hold (the cut at
     # the hold start is a guess) and are then frozen, chain restarts stop, and
     # the states saved from then on (trace "draws_from_step") are the posterior
