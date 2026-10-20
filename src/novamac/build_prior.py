@@ -4,12 +4,12 @@ import types
 import astrophot as ap
 import jax.numpy as jnp
 
-from .host_prior import load_prior
+from .host_prior import Prior, load_prior
 
 
 def build_prior(
     model: ap.Model,
-    host_prior_loc: str,
+    host_prior_loc,
     wcs_prior_width: float = 0.3,
     ps_position_prior_width: float = 0.5,
     logflux_prior_width: float = 2.0,
@@ -27,7 +27,7 @@ def build_prior(
 
     Args:
       - model: The full constructed AstroPhot model
-      - host_prior_loc: The location of the host prior, a path to the checkpoint directory (str)
+      - host_prior_loc: The host prior: a path to the checkpoint directory (str) or a loaded host_prior.Prior
       - prior_scene_factor: the host prior is evaluated at log(I) + log(prior_scene_factor),
         i.e. it is shown a scene this many times brighter than the one the likelihood
         renders (an experiment: brighter training objects come with flatter, simpler
@@ -51,7 +51,7 @@ def build_prior(
     psf_q0 = jnp.array(model.meta.psf_q0)
     psf_PA0 = jnp.array(model.meta.psf_PA0)
     not_template = jnp.array(~model.meta.is_template)
-    host_prior = load_prior(host_prior_loc)
+    host_prior = host_prior_loc if isinstance(host_prior_loc, Prior) else load_prior(host_prior_loc)
     # Keep the prior object and the widths reachable from the model, e.g. for
     # a sampler that needs the sigma(t) schedule or wants to seed a mass
     # matrix from the prior widths.
