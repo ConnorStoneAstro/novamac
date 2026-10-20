@@ -176,8 +176,8 @@ class Novamac:
     freeze_scene_scale = True
     release_t = {
         "scene_scale": 0.4,  # the scene's overall scale factor: free from the start (if not frozen)
-        "sky": 0.7,
-        "alignment": 0.7,  # per-image crtan
+        "sky": 0.4,
+        "alignment": 0.4,  # per-image crtan
         "ps_flux": 0.3,
         "ps_center": 0.3,
         "psf": 0.3,
@@ -278,10 +278,10 @@ class Novamac:
     )
     target_acceptance = 0.6
     acceptance_tol = 0.05
-    step_down, step_up = 0.7, 1.2  # during annealing / hold
+    step_down, step_up = 0.7, 1.3  # during annealing / hold
     # Faster during warmup: the initial search happens far from the typical set
     # where gradients are large, so it starts tiny and must catch up quickly
-    step_down_warmup, step_up_warmup = 0.5, 1.5
+    step_down_warmup, step_up_warmup = 0.4, 1.6
 
     hutchinson_probes = 256  # for diag(J J^T); relative error ~ sqrt(2 / probes)
     hutchinson_batch = 32
@@ -325,7 +325,7 @@ class Novamac:
     # at least init_min_templates, otherwise every image. init_subsample:
     # subpixels per scene pixel into which each data pixel is cut.
     init_threshold_sigma = 3.0
-    init_sky_border = 4
+    init_sky_border = 5
     init_min_templates = 4
     init_subsample = 5
     # Aperture for the initial point-source fluxes when none are given:
@@ -341,12 +341,12 @@ class Novamac:
     prior_widths = {
         "wcs": None,  # arcsec; None = one data pixel
         "ps_position": 0.5,  # arcsec
-        "logflux": 2.0,  # natural log of the point source flux
-        "psf_n": 0.5,
-        "psf_Rd": 0.2,  # relative
-        "psf_q": 0.1,
-        "psf_PA": 0.2,  # rad
-        "scene_scale": 3.0,  # natural log; None for an improper flat prior
+        "logflux": 3.0,  # natural log of the point source flux
+        "psf_n": 0.2,
+        "psf_Rd": 0.1,  # relative
+        "psf_q": 0.05,
+        "psf_PA": 0.1,  # rad
+        "scene_scale": 2.0,  # natural log; None for an improper flat prior
     }
 
     def __init__(
