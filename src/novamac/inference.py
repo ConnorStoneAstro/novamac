@@ -173,14 +173,14 @@ class Novamac:
     # expectation be absorbed by one coordinate instead of by every scene
     # pixel. freeze_scene_scale keeps it at the unit conversion. It is always
     # frozen in the prior-only and frozen test modes, where nothing constrains it.
-    freeze_scene_scale = False
+    freeze_scene_scale = True
     release_t = {
         "scene_scale": 0.4,  # the scene's overall scale factor: free from the start (if not frozen)
         "sky": 0.7,
         "alignment": 0.7,  # per-image crtan
-        "ps_flux": 0.25,
+        "ps_flux": 0.3,
         "ps_center": 0.3,
-        "psf": 0.25,
+        "psf": 0.3,
     }
     # Blocks listed here are not released at release_t unconditionally: from
     # release_t on, their curvature is probed every release_probe_every chunks and
