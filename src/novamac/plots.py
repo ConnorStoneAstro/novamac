@@ -27,7 +27,10 @@ and writes PDFs next to the products:
 and, at one saved state (the last of chain 0 by default), the image-level
 fit diagnostics:
   {name}_fit_fluxes.pdf, {name}_fit_target_shifts.pdf, {name}_core_pix_{linear,log}.png,
-  {name}_residual_histogram.pdf, {name}_target.pdf, {name}_fit_model.pdf, {name}_fit_residual.pdf
+  {name}_residual_histogram.pdf, {name}_target.pdf, {name}_fit_model.pdf, {name}_fit_residual.pdf,
+  {name}_fit_psf.pdf (every epoch's PSF model in its upsampled space, one
+  linear colour scale from zero, with the flux fraction in the outermost
+  pixel ring: large values mean the PSF footprint clips the wings)
 """
 
 import traceback
@@ -492,6 +495,53 @@ def image_grid(n_images):
     return fig, axes
 
 
+def render_psfs(model, nm):
+    """Every epoch's PSF model image (N, h, w) in the PSF's own (upsampled)
+    pixel space, each normalised to unit sum, from the fitted per-image
+    Moffat parameters; and the fraction of each one's flux in its outermost
+    pixel ring (N,)."""
+    psf = model.models.pixelated_batch_model.model.psf
+    shape = tuple(int(v) for v in np.asarray(psf.target.data).shape[-2:])
+    up = int(nm.psf_upsample)
+    n, Rd, q, PA = (np.asarray(getattr(psf, k).npvalue, dtype=float).reshape(-1) for k in ("n", "Rd", "q", "PA"))
+    N = nm.n_images
+    n, Rd, q, PA = (np.broadcast_to(v, (N,)) for v in (n, Rd, q, PA))
+    images, edge = np.zeros((N,) + shape), np.zeros(N)
+    for i in range(N):
+        one = ap.Model(
+            name=f"psf_{i}", model_type="moffat ellipse psf model", n=float(n[i]), Rd=float(Rd[i]), q=float(q[i]), PA=float(PA[i]),
+            sampling_mode="simpsons", integrate_mode="none", target=ap.PSFImage(data=np.zeros(shape), upsample=up),
+        )  # fmt: skip
+        img = np.asarray(one().data, dtype=float)
+        total = img.sum()
+        images[i] = img / total if total > 0 else img
+        ring = np.ones(shape, bool)
+        ring[1:-1, 1:-1] = False
+        edge[i] = images[i][ring].sum()
+    return images, edge
+
+
+def plot_psf_grid(nm, model):
+    """Grid of the epochs' PSF models (render_psfs) on one linear colour
+    scale from zero, the edge flux fraction in each title."""
+    images, edge = render_psfs(model, nm)
+    N = len(images)
+    fig, axes = image_grid(N)
+    vmax = float(images.max())
+    for i, ax in enumerate(axes[:N]):
+        im = ax.imshow(images[i], cmap="inferno", origin="lower", vmin=0.0, vmax=vmax, interpolation="none")
+        ax.set_title(f"{nm.target_names[i]}\nedge {100 * edge[i]:.2f}%", fontsize=6)
+    fig.colorbar(im, ax=list(axes), fraction=0.02, pad=0.02, label="PSF (unit sum), linear")
+    h, w = images.shape[1:]
+    fig.suptitle(f"{nm.name}: PSF models, {h}x{w} px at {nm.psf_upsample}x; max edge-ring flux {100 * edge.max():.2f}%", fontsize=9, y=1.06)
+    path = nm.files.figure("fit_psf")
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    log(f"PSF footprint: flux in the outermost pixel ring median {100 * np.median(edge):.3f}%, max {100 * edge.max():.3f}%"
+        + (" <-- the footprint clips the wings; enlarge psf_shape" if edge.max() > 0.01 else ""))
+    return path
+
+
 def plot_fit_state(nm, chain=0, index=-1):
     """Light curve, alignment shifts, host images, residual histogram and the
     target / model / residual image grids at saved state `index` of `chain`."""
@@ -578,6 +628,7 @@ def plot_fit_state(nm, chain=0, index=-1):
             paths.append(files.figure(name))
             fig.savefig(paths[-1])
             plt.close(fig)
+    paths.append(plot_psf_grid(nm, model))
     return paths
 
 

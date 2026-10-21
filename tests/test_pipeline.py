@@ -18,7 +18,7 @@ from novamac.products import RunFiles, collect_fluxes
 FIGURES = (
     "sample_progress", "sample_scene", "sample_tweedie", "sample_fluxes", "sample_flux_trace",
     "sample_alignment_trace", "sample_nuisance_trace", "fit_fluxes", "fit_target_shifts",
-    "residual_histogram", "target", "fit_model", "fit_residual",
+    "residual_histogram", "target", "fit_model", "fit_residual", "fit_psf",
 )  # fmt: skip
 
 
