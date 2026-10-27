@@ -202,6 +202,9 @@ def prior_transform(scene, scene_scale, softening, prior_scene_factor=1.0):
     """
     f_prior = np.asarray(scene, dtype=float) / scene_scale * prior_scene_factor
     softened = softening * np.logaddexp(0.0, f_prior / softening) / prior_scene_factor
+    # softplus underflows to exactly 0 for f / s < -745, and log(0) = -inf would
+    # poison the start: floor at a negligible fraction of the pedestal
+    softened = np.maximum(softened, 1e-12 * softening * np.log(2.0) / prior_scene_factor)
     return softened * scene_scale, int(np.sum(f_prior < 0))
 
 
