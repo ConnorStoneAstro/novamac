@@ -123,13 +123,17 @@ def calibrate_prior_offset(model, scene_log, rng_key, n_sigmas=64):
     z = jax.random.normal(rng_key, scene.shape, DTYPE)
     values = np.array([float(prior.energy(scene + float(sg) * z, float(sg))) / n_pix for sg in sigmas])
     log_sig = jnp.asarray(np.log(sigmas), DTYPE)
-    if np.all(values > 0):
+    if np.all(values > 0) or np.all(values < 0):
         # the "dae" level is ~ (s^2 + sigma^2) / sigma^2, a power law at small
         # sigma: linear interpolation in log-log is nearly exact, whereas linear
         # in the value overshoots between nodes by a few percent of ~600 per
-        # pixel, which showed as a sawtooth of ~1e5 in the logged log prior
-        log_vals = jnp.asarray(np.log(values), DTYPE)
-        model.meta.prior_energy_offset = lambda sigma: jnp.exp(jnp.interp(jnp.log(sigma), log_sig, log_vals))
+        # pixel, which showed as a sawtooth of ~1e4 in the logged log prior
+        # with one tooth per node (the last one ending at sigma_min, i.e. at
+        # the hold start). The sign is whatever the prior's energy convention
+        # gives; the magnitude is what follows the power law.
+        sign = float(np.sign(values[0]))
+        log_vals = jnp.asarray(np.log(np.abs(values)), DTYPE)
+        model.meta.prior_energy_offset = lambda sigma: sign * jnp.exp(jnp.interp(jnp.log(sigma), log_sig, log_vals))
     else:
         vals = jnp.asarray(values, DTYPE)
         model.meta.prior_energy_offset = lambda sigma: jnp.interp(jnp.log(sigma), log_sig, vals)
