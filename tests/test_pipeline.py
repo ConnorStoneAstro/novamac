@@ -96,3 +96,22 @@ def test_frozen_run(tmp_path, prior_dir, synthetic):
     assert np.all(trace["block_release_step"] < 0)
     assert not np.any(np.isfinite(trace["accept_prob_nuis"]))
     nm.plot_all(raise_errors=True)
+
+
+@pytest.mark.slow
+def test_plateau_run(tmp_path, prior_dir, synthetic):
+    inputs, _ = synthetic
+    s = dict(FAST_SETTINGS, plateau_steps=16, plateau_at=0.5)
+    nm = Novamac(prior=prior_dir, out_dir=tmp_path / "out", name="syn_g_plateau", **s, **inputs)
+    trace = nm.sample()
+    assert int(trace["steps_done"]) == s["warmup_steps"] + s["anneal_steps"] + s["plateau_steps"] + s["hold_steps"]
+    assert int(trace["anneal_steps"]) == s["anneal_steps"] + s["plateau_steps"]
+    p0 = int(trace["plateau_step"])
+    assert s["warmup_steps"] < p0 < s["warmup_steps"] + s["anneal_steps"]
+    assert 0 < float(trace["plateau_t"]) <= 0.5 * float(trace["t_start"])
+    # the predictor is idle on the plateau: no scene displacement by it
+    assert np.allclose(trace["predictor_rms"][p0 : p0 + s["plateau_steps"]], 0.0)
+    assert int(trace["draws_from_step"]) > p0 + s["plateau_steps"]
+    assert np.all(np.isfinite(trace["logdensity"]))
+    nm.plot_progress()
+    assert nm.files.figure("sample_progress").exists()

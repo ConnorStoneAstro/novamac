@@ -30,10 +30,21 @@ def start_time(sde, sigma_start):
     return t
 
 
-def build_schedule(t_start, warmup_steps, anneal_steps, hold_steps):
-    """Diffusion time t of every step: warmup at t_start, linear t_start -> 0, hold at 0."""
+def build_schedule(t_start, warmup_steps, anneal_steps, hold_steps, plateau_at=None, plateau_steps=0):
+    """Diffusion time t of every step: warmup at t_start, linear t_start -> 0
+    over anneal_steps, hold at 0. With plateau_steps > 0 the anneal pauses for
+    that many steps (constant t, no predictor displacement) at the first step
+    whose t is <= plateau_at * t_start, so the anneal phase is anneal_steps +
+    plateau_steps long. Returns (t per step, plateau start step or -1)."""
     anneal = t_start * (1.0 - np.arange(1, anneal_steps + 1) / anneal_steps)
-    return np.concatenate([np.full(warmup_steps, t_start), anneal, np.zeros(hold_steps)])
+    plateau_step = -1
+    if plateau_steps > 0:
+        if plateau_at is None or not 0.0 < plateau_at <= 1.0:
+            raise ValueError(f"plateau_at={plateau_at} must be a fraction of t_start in (0, 1] when plateau_steps > 0")
+        k = int(np.argmax(anneal <= plateau_at * t_start))
+        anneal = np.concatenate([anneal[: k + 1], np.full(plateau_steps, anneal[k]), anneal[k + 1 :]])
+        plateau_step = warmup_steps + k + 1
+    return np.concatenate([np.full(warmup_steps, t_start), anneal, np.zeros(hold_steps)]), plateau_step
 
 
 # Parameter blocks

@@ -27,6 +27,11 @@ Schedule (see hmc.py for the method)
                                           scene's reverse diffusion (prior score
                                           only), then one HMC corrector
                                           transition at the new t (likelihood)
+  plateau  plateau_steps at t = plateau_at * t_start, inside the anneal (off when
+                                          plateau_steps = 0): the predictor is idle
+                                          and the HMC correctors run at a fixed
+                                          temperature, time for the chain to settle
+                                          before the anneal continues
   hold     hold_steps at t = 0            HMC only at the true posterior; the
                                           step sizes adapt for hold_adapt_chunks
                                           more chunks, then every kernel is fixed
@@ -129,6 +134,8 @@ class Novamac:
     sigma_start = 1.0
     warmup_steps = 256  # at t = t_start, HMC only
     anneal_steps = 4096  # t from t_start down to 0, predictor + corrector
+    plateau_at = 0.5  # fraction of t_start at which the anneal pauses (when plateau_steps > 0)
+    plateau_steps = 0  # steps at that fixed t in the middle of the anneal; the anneal phase is anneal_steps + plateau_steps long
     hold_steps = 512  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
     # The step sizes keep adapting for this many chunks of the hold (the cut at
     # the hold start is a guess) and are then frozen, chain restarts stop, and
@@ -591,6 +598,11 @@ class Novamac:
         }
 
     @property
+    def anneal_total(self):
+        """Length of the anneal phase: anneal_steps plus the plateau."""
+        return self.anneal_steps + self.plateau_steps
+
+    @property
     def n_images(self):
         return self.data.shape[0]
 
@@ -805,7 +817,7 @@ class Novamac:
     def phase_of(self, step):
         if step <= self.warmup_steps:
             return "warmup"
-        if step <= self.warmup_steps + self.anneal_steps:
+        if step <= self.warmup_steps + self.anneal_total:
             return "anneal"
         return "hold"
 
@@ -1067,7 +1079,9 @@ class Novamac:
             p.unlink(missing_ok=True)
         tpath = files.trace
 
-        ts = build_schedule(t_start, self.warmup_steps, self.anneal_steps, self.hold_steps)
+        ts, plateau_step = build_schedule(
+            t_start, self.warmup_steps, self.anneal_steps, self.hold_steps, self.plateau_at, self.plateau_steps
+        )
         ts_prev = np.concatenate([[ts[0]], ts[:-1]])  # t of the step before each step
         total = len(ts)
         chunk_bounds = [
@@ -1075,7 +1089,7 @@ class Novamac:
         ]
         n_chunks = len(chunk_bounds)
         # from this step on every kernel is fixed (no adaptation, no restarts): the draws
-        hold_start = self.warmup_steps + self.anneal_steps
+        hold_start = self.warmup_steps + self.anneal_total
         draws_from = (
             min(total, hold_start + self.hold_adapt_chunks * self.chunk_steps)
             if self.hold_steps > 0
@@ -1087,7 +1101,10 @@ class Novamac:
             "settings": json.dumps(self.settings(), default=str),
             "num_chains": C,
             "warmup_steps": self.warmup_steps,
-            "anneal_steps": self.anneal_steps,
+            "anneal_steps": self.anneal_total,  # the anneal phase as run, plateau included (plots, diagnostics)
+            "plateau_steps": self.plateau_steps,
+            "plateau_step": plateau_step,  # first step of the plateau, -1 without one
+            "plateau_t": float(ts[plateau_step]) if plateau_step >= 0 else np.nan,
             "hold_steps": self.hold_steps,
             "chunk_steps": self.chunk_steps,
             "t_start": t_start,
@@ -1272,6 +1289,7 @@ class Novamac:
         save_tweedie(ts[0])
         log(
             f"schedule: {self.warmup_steps} warmup + {self.anneal_steps} anneal + {self.hold_steps} hold = {total} steps in {n_chunks} chunks"
+            + (f"; the anneal pauses for {self.plateau_steps} steps at t={ts[plateau_step]:.3f} (step {plateau_step})" if plateau_step >= 0 else "")
         )
 
         # Chunk loop
@@ -1303,7 +1321,7 @@ class Novamac:
                         "likelihood's range (float32 exp overflow) and the chain cannot recover from here"
                     )
             lik_on = on_now
-            if s0 == self.warmup_steps + self.anneal_steps and self.hold_steps > 0:
+            if s0 == self.warmup_steps + self.anneal_total and self.hold_steps > 0:
                 step_size = step_size * self.hold_step_factor
                 step_size_nuis = step_size_nuis * self.hold_step_factor
                 log(

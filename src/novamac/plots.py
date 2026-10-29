@@ -77,6 +77,9 @@ def phase_marks(trace):
     """(step, label) of the schedule's phase boundaries."""
     warmup, anneal = int(trace["warmup_steps"]), int(trace["anneal_steps"])
     marks = [(warmup, "anneal start"), (warmup + anneal, "hold (t=0)")]
+    if int(trace.get("plateau_steps", 0)) > 0:
+        p0 = int(trace["plateau_step"])
+        marks += [(p0, f"plateau (t={float(trace['plateau_t']):.2f})"), (p0 + int(trace["plateau_steps"]), "anneal resumes")]
     if "draws_from_step" in trace and int(trace["draws_from_step"]) > warmup + anneal:
         marks.append((int(trace["draws_from_step"]), "kernels fixed: draws"))
     if int(trace.get("likelihood_on_step", 0)) > 0:
