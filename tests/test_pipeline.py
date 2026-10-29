@@ -101,17 +101,23 @@ def test_frozen_run(tmp_path, prior_dir, synthetic):
 @pytest.mark.slow
 def test_plateau_run(tmp_path, prior_dir, synthetic):
     inputs, _ = synthetic
-    s = dict(FAST_SETTINGS, plateau_steps=16, plateau_at=0.5)
+    s = dict(FAST_SETTINGS, plateau_steps=16, plateau_at=[0.7, 0.3], frozen_blocks=("sky",))
     nm = Novamac(prior=prior_dir, out_dir=tmp_path / "out", name="syn_g_plateau", **s, **inputs)
     trace = nm.sample()
-    assert int(trace["steps_done"]) == s["warmup_steps"] + s["anneal_steps"] + s["plateau_steps"] + s["hold_steps"]
-    assert int(trace["anneal_steps"]) == s["anneal_steps"] + s["plateau_steps"]
-    p0 = int(trace["plateau_step"])
-    assert s["warmup_steps"] < p0 < s["warmup_steps"] + s["anneal_steps"]
-    assert 0 < float(trace["plateau_t"]) <= 0.5 * float(trace["t_start"])
-    # the predictor is idle on the plateau: no scene displacement by it
-    assert np.allclose(trace["predictor_rms"][p0 : p0 + s["plateau_steps"]], 0.0)
-    assert int(trace["draws_from_step"]) > p0 + s["plateau_steps"]
+    assert int(trace["steps_done"]) == s["warmup_steps"] + s["anneal_steps"] + 2 * s["plateau_steps"] + s["hold_steps"]
+    assert int(trace["anneal_steps"]) == s["anneal_steps"] + 2 * s["plateau_steps"]
+    starts = np.asarray(trace["plateau_step"], dtype=int)
+    assert len(starts) == 2 and starts[0] < starts[1]
+    assert s["warmup_steps"] < starts[0] and starts[1] + s["plateau_steps"] <= s["warmup_steps"] + int(trace["anneal_steps"])
+    t_start = float(trace["t_start"])
+    assert 0 < trace["plateau_t"][1] <= 0.3 * t_start < trace["plateau_t"][0] <= 0.7 * t_start
+    # the predictor is idle on the plateaus: no scene displacement by it
+    for p0 in starts:
+        assert np.allclose(trace["predictor_rms"][p0 : p0 + s["plateau_steps"]], 0.0)
+    assert int(trace["draws_from_step"]) > starts[1] + s["plateau_steps"]
     assert np.all(np.isfinite(trace["logdensity"]))
+    names = list(trace["block_names"]) if "block_names" in trace else []
+    if "sky" in names:
+        assert trace["block_release_step"][names.index("sky")] < 0, "the frozen sky block is never released"
     nm.plot_progress()
     assert nm.files.figure("sample_progress").exists()

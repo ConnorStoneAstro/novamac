@@ -31,20 +31,27 @@ def start_time(sde, sigma_start):
 
 
 def build_schedule(t_start, warmup_steps, anneal_steps, hold_steps, plateau_at=None, plateau_steps=0):
-    """Diffusion time t of every step: warmup at t_start, linear t_start -> 0
-    over anneal_steps, hold at 0. With plateau_steps > 0 the anneal pauses for
-    that many steps (constant t, no predictor displacement) at the first step
-    whose t is <= plateau_at * t_start, so the anneal phase is anneal_steps +
-    plateau_steps long. Returns (t per step, plateau start step or -1)."""
+    """The diffusion time per step: warmup_steps at t_start, linear to 0
+    over anneal_steps, hold at 0. With plateau_steps > 0 the anneal pauses
+    for plateau_steps steps at each of the fractions of t_start in plateau_at
+    (a number or a sequence): each pause sits right after the first anneal
+    step whose t is <= that fraction times t_start, so the anneal phase is
+    anneal_steps + plateau_steps * len(plateau_at) long. Returns (t per step,
+    the plateaus' first steps as an int array, empty without plateaus)."""
     anneal = t_start * (1.0 - np.arange(1, anneal_steps + 1) / anneal_steps)
-    plateau_step = -1
+    starts = []
     if plateau_steps > 0:
-        if plateau_at is None or not 0.0 < plateau_at <= 1.0:
-            raise ValueError(f"plateau_at={plateau_at} must be a fraction of t_start in (0, 1] when plateau_steps > 0")
-        k = int(np.argmax(anneal <= plateau_at * t_start))
-        anneal = np.concatenate([anneal[: k + 1], np.full(plateau_steps, anneal[k]), anneal[k + 1 :]])
-        plateau_step = warmup_steps + k + 1
-    return np.concatenate([np.full(warmup_steps, t_start), anneal, np.zeros(hold_steps)]), plateau_step
+        fractions = [] if plateau_at is None else np.atleast_1d(np.asarray(plateau_at, dtype=float))
+        if len(fractions) == 0 or np.any((fractions <= 0.0) | (fractions > 1.0)):
+            raise ValueError(f"plateau_at={plateau_at} must be fractions of t_start in (0, 1] when plateau_steps > 0")
+        pieces, k0 = [], 0
+        for frac in sorted(set(fractions.tolist()), reverse=True):  # highest t first: anneal order
+            k = int(np.argmax(anneal <= frac * t_start))
+            starts.append(warmup_steps + k + 1 + plateau_steps * len(starts))
+            pieces += [anneal[k0 : k + 1], np.full(plateau_steps, anneal[k])]
+            k0 = k + 1
+        anneal = np.concatenate(pieces + [anneal[k0:]])
+    return np.concatenate([np.full(warmup_steps, t_start), anneal, np.zeros(hold_steps)]), np.asarray(starts, dtype=int)
 
 
 # Parameter blocks
