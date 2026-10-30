@@ -192,6 +192,59 @@ def soft_threshold(f, count, k=3.0, width=1.0):
     return f * w, sigma, frac
 
 
+def gaussian_smooth(img, sigma):
+    """Separable Gaussian smoothing of a 2-d array with zero padding
+    (kernel truncated at 4 sigma), numpy only."""
+    r = max(int(np.ceil(4.0 * sigma)), 1)
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    k /= k.sum()
+    # explicit zero padding + "valid" keeps the output the image's size even
+    # when the kernel is longer than an axis ("same" would not)
+    conv = lambda v: np.convolve(np.pad(v, r), k, mode="valid")  # noqa: E731
+    out = np.apply_along_axis(conv, 1, np.asarray(img, dtype=float))
+    return np.apply_along_axis(conv, 0, out)
+
+
+def fill_uncovered(f, count, sigma, max_iter=500, tol=1e-4):
+    """
+    Fill the pixels no image covers (count == 0) with a smooth extension of
+    the covered ones: the image is Gaussian-smoothed (zero padded), the
+    uncovered pixels take the smoothed values and the covered pixels are put
+    back, repeated to a fixed point. A single pass leaves a step at the
+    coverage edge (half the kernel sees empty pixels there); the fixed point
+    is continuous at the edge and decays toward the array border, so a
+    source cut by the edge of the data tails off instead of ending in a
+    cliff that the prior reads as structure. The covered pixels are
+    untouched. Returns (filled, n_iter); a no-op when everything is covered.
+    """
+    f = np.asarray(f, dtype=float)
+    covered = np.asarray(count) > 0
+    if covered.all() or sigma <= 0:
+        return f.copy(), 0
+    scale = max(float(np.max(np.abs(f[covered]))), 1e-30)
+    out = f.copy()
+    out[~covered] = 0.0
+    for it in range(1, max_iter + 1):
+        smooth = gaussian_smooth(out, sigma)
+        new = np.where(covered, f, smooth)
+        change = float(np.max(np.abs(new - out)))
+        out = new
+        if change < tol * scale:
+            break
+    return out, it
+
+
+def covered_edge(uncovered):
+    """Covered pixels with an uncovered 4-neighbour (the edge of the coverage)."""
+    u = np.asarray(uncovered, dtype=bool)
+    near = np.zeros_like(u)
+    near[1:, :] |= u[:-1, :]
+    near[:-1, :] |= u[1:, :]
+    near[:, 1:] |= u[:, :-1]
+    near[:, :-1] |= u[:, 1:]
+    return near & ~u
+
+
 def prior_transform(scene, scene_scale, softening, prior_scene_factor=1.0):
     """
     The scene (data units per arcsec^2) through the prior's flux transform,
@@ -269,7 +322,7 @@ def aperture_fluxes(residual, weight, mask, crpix, crtan, CD, position, psf_n, p
 
 def prepare_initial_scene(data, weight, mask, is_template, crpix, crtan, CD, scene_shape, pix_scale, center, *,
                           scene_scale, softening, prior_scene_factor=1.0, init_image=None, sky=None,
-                          threshold_sigma=3.0, min_templates=4, subsample=5):
+                          threshold_sigma=3.0, fill_sigma=0.0, min_templates=4, subsample=5):
     """
     The sampler's initial scene: `init_image` (data units per arcsec^2 on
     the scene grid) if given, else the drizzled template stack; then the
@@ -307,6 +360,14 @@ def prepare_initial_scene(data, weight, mask, is_template, crpix, crtan, CD, sce
         report.append(
             f"soft threshold at {threshold_sigma:g} x the init's own noise ({noise:.3g} data units/arcsec^2 = "
             f"{noise / scene_scale:.3g} nJy/prior px): {100 * frac:.0f}% of the covered pixels start on the sky pedestal"
+        )
+    uncovered = count == 0
+    if fill_sigma and uncovered.any():
+        scene, n_iter = fill_uncovered(scene, count, fill_sigma)
+        report.append(
+            f"{int(uncovered.sum())} uncovered pixels filled by Gaussian relaxation (sigma {fill_sigma:g} scene px, "
+            f"{n_iter} iterations): their median is {np.median(scene[uncovered]):.3g} data units/arcsec^2, "
+            f"the covered edge's median {np.median(scene[covered_edge(uncovered)]):.3g}"
         )
     scene, n_neg = prior_transform(scene, scene_scale, softening, prior_scene_factor)
     pedestal = softening * np.log(2.0)

@@ -340,6 +340,13 @@ class Novamac:
     # at least init_min_templates, otherwise every image. init_subsample:
     # subpixels per scene pixel into which each data pixel is cut.
     init_threshold_sigma = 3.0
+    # init_fill_sigma: the scene pixels no image covers (the PSF margin, and
+    # the corners the rotated visits miss) are filled by a smooth extension
+    # of the covered pixels (init_scene.fill_uncovered, Gaussian relaxation
+    # with this sigma in scene pixels) instead of starting on the pedestal,
+    # so a source cut by the edge of the data tails off rather than ending in
+    # a cliff; 0 leaves them on the pedestal.
+    init_fill_sigma = 4.0
     init_sky_border = 5
     init_min_templates = 4
     init_subsample = 5
@@ -654,7 +661,8 @@ class Novamac:
             self.data, self.weight, self.mask, self.is_template, self.crpix, crtan, self.CD, self.scene_shape,
             self.scene_pixel_scale, self.ps_center[0], scene_scale=self.scene_scale0, softening=self.prior.transform.softening,
             prior_scene_factor=self.prior_scene_factor, init_image=self.init_image, sky=self._border,
-            threshold_sigma=self.init_threshold_sigma, min_templates=self.init_min_templates, subsample=self.init_subsample,
+            threshold_sigma=self.init_threshold_sigma, fill_sigma=self.init_fill_sigma, min_templates=self.init_min_templates,
+            subsample=self.init_subsample,
         )  # fmt: skip
 
     def build_model(self):

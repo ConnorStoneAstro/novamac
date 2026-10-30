@@ -10,6 +10,7 @@ from novamac.sampler import flat_data_weight
 from novamac.init_scene import (
     aperture_fluxes,
     border_sky,
+    fill_uncovered,
     moffat_enclosed,
     moffat_fwhm,
     prior_transform,
@@ -110,6 +111,34 @@ def test_soft_threshold(rotated_images):
     assert 0.6 < frac < 0.95
     assert cleaned[peak_faint] > 0.5 * d["truth"][peak_faint], "faint source kept"
     assert np.all(cleaned[count == 0] == 0)
+
+
+def test_fill_uncovered_is_continuous_and_decays():
+    H = W = 40
+    rr, cc = np.mgrid[:H, :W]
+    count = ((rr - 20) ** 2 + (cc - 20) ** 2 < 12**2).astype(int)
+    f = np.where(count > 0, 100.0, 0.0)
+    filled, n_iter = fill_uncovered(f, count, sigma=2.0)
+    assert 0 < n_iter < 500
+    assert np.array_equal(filled[count > 0], f[count > 0]), "covered pixels untouched"
+    assert np.all(filled >= 0) and np.all(filled[count == 0] <= 100 + 1e-9)
+    ring = (count == 0) & ((rr - 20) ** 2 + (cc - 20) ** 2 < 13**2)
+    assert np.all(filled[ring] > 60), "continuous at the coverage edge, no step"
+    assert filled[0, 0] < filled[20, 33] < 100, "decays toward the array border"
+    same, zero = fill_uncovered(f, np.ones_like(count), sigma=2.0)
+    assert zero == 0 and np.array_equal(same, f)
+
+
+def test_fill_uncovered_on_a_stack(rotated_images):
+    d = rotated_images
+    stack, count, _, _ = stack_templates(
+        d["data"], d["weight"], d["mask"], d["is_template"], d["crpix"], d["crtan"], d["CD"], (d["H"], d["W"]), d["pix"], d["center"]
+    )
+    cleaned, _, _ = soft_threshold(stack, count, 3.0)
+    assert (count == 0).any()
+    filled, _ = fill_uncovered(cleaned, count, sigma=3.0)
+    assert np.all(np.isfinite(filled)) and np.array_equal(filled[count > 0], cleaned[count > 0])
+    assert np.all(filled[count == 0] >= min(0.0, cleaned.min()))
 
 
 def test_prior_transform():
