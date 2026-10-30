@@ -107,6 +107,7 @@ from .sampler import (
     setup_inverse_mass,
     start_time,
     write_trace,
+    lagging_chains,
 )
 from .utils import Timer, enable_console_logging, log, save_json
 
@@ -223,28 +224,23 @@ class Novamac:
     # of its posterior width per transition.
     nuisance_hmc = True
     nuisance_integration_steps = 10
-    # A chain whose step size has collapsed (an unlucky start, or a stiff spot
-    # the adaptation walked down into) is dragged by the unadjusted predictor
-    # while its corrector cannot correct, and it does not recover on its own.
-    # A chain whose scene step size has been below restart_step_ratio x the
-    # chain median for restart_chunks consecutive chunks is restarted from the
-    # state and step sizes of the healthiest chain (the highest log density
-    # among the others). Checked after every chunk from the second chunk on.
-    # Two more stall signatures, same restart, same persistence:
-    #   dead:    scene acceptance below restart_dead_acceptance (the step is far
-    #            too large; the few moves that do get accepted are wild jumps)
-    #   outlier: log density further from the median of the other chains than
-    #            restart_outlier_factor x their spread (max - min, at least
-    #            restart_outlier_min), in either direction: a chain in a basin
-    #            of its own (needs three or more chains)
-    # A restarted chain shares its past with its source, so the chains are no
-    # longer independent; prefer that to a dead chain.
-    restart_collapsed_chains = True
-    restart_step_ratio = 0.1
+    # A chain that has fallen behind the others on the data (its log-likelihood
+    # more than restart_loglik_gap below the top chain's at the end of
+    # restart_chunks consecutive chunks) is restarted from the top chain's
+    # state and step sizes. Only from t <= restart_from_t on: earlier the
+    # likelihood is still broadened and healthy chains sit thousands apart (in
+    # the mock runs the spread across chains falls from ~2000 at t_start to
+    # <100 by t = 0.2). The likelihood, not the density: the prior energy of
+    # the margin pixels differs by ~1e4 between chains that agree on the data,
+    # and a chain in a sharp healthy mode has a small step size, so neither
+    # the density nor the step size tells a bad chain from a good one. Restarts
+    # stop when the draws start. A restarted chain shares its past with its
+    # source, so the chains are no longer independent; prefer that to a chain
+    # stuck in a bad mode.
+    restart_lagging_chains = True
+    restart_loglik_gap = 2000.0
+    restart_from_t = 0.35
     restart_chunks = 2
-    restart_dead_acceptance = 0.05
-    restart_outlier_factor = 5.0
-    restart_outlier_min = 2000.0
     # The host prior's per-pixel energy level is subtracted inside its sum
     # (model.meta.prior_energy_offset, a function of sigma; see build_prior):
     # the raw total is ~1e7 at small sigma, where float32 resolves only ~1, and a
@@ -1166,6 +1162,7 @@ class Novamac:
             "step_size_nuis": np.full((n_chunks, C), np.nan),
             "scores": np.full((n_chunks, C, len(SCORE_FIELDS)), np.nan),
             "chunk_logdensity": np.full((n_chunks, C), np.nan),  # of the state at the end of the chunk, after the Gibbs refresh
+            "chunk_loglik": np.full((n_chunks, C), np.nan),  # log-likelihood at the last step of the chunk (the restart check's input)
             # linear Gibbs refresh at the end of each chunk: acceptance, and the
             # proposal's mean / covariance of the physical sky + flux values (the
             # likelihood's conditional, before the prior and the positivity constraint)
@@ -1236,9 +1233,7 @@ class Novamac:
             -1
         )  # chunk index until which the adaptation uses the warmup rates (set at the likelihood switch)
         rewarm_nuis_until = -1  # same for the non-scene step (set when it first exists)
-        stall_chunks = {
-            k: np.zeros(C, dtype=int) for k in ("collapsed", "dead", "outlier")
-        }  # consecutive chunks flagged, per chain
+        lag_chunks = np.zeros(C, dtype=int)  # consecutive chunks a chain has lagged on the likelihood
         score_fns = {
             True: make_score_fn(target, broaden_fn, scene_idx),
             False: make_score_fn(target_off, broaden_fn, scene_idx),
@@ -1463,6 +1458,8 @@ class Novamac:
                 scores, logp_end = np.asarray(scores), np.asarray(logp_post)
             trace["scores"][ci] = scores
             trace["chunk_logdensity"][ci] = logp_end
+            ll_end = np.asarray(ctrace["loglik"])[:, -1]
+            trace["chunk_loglik"][ci] = ll_end
             trace["step_size"][ci] = step_size
 
             # Step size adaptation for the next chunk (until the draws start)
@@ -1495,50 +1492,27 @@ class Novamac:
                     + "; no more adaptation or restarts, the states saved from here on are the posterior draws"
                 )
 
-            # Stalled chains restart from the healthiest chain (until the draws start)
-            if self.restart_collapsed_chains and C > 1 and ci >= 1 and adapting:
-                flags = {
-                    "collapsed": step_size < self.restart_step_ratio * float(np.median(step_size)),
-                    "dead": acceptance < self.restart_dead_acceptance,
-                    "outlier": np.zeros(C, dtype=bool),
-                }
-                if C > 2:
-                    for c in range(C):
-                        others = np.delete(logp_end, c)
-                        spread = max(
-                            float(np.max(others) - np.min(others)), self.restart_outlier_min
-                        )
-                        flags["outlier"][c] = (
-                            abs(logp_end[c] - float(np.median(others)))
-                            > self.restart_outlier_factor * spread
-                        )
-                for nm_, flag in flags.items():
-                    stall_chunks[nm_] = np.where(flag, stall_chunks[nm_] + 1, 0)
-                stalled = np.zeros(C, dtype=bool)
-                reasons = {}
-                for nm_, count in stall_chunks.items():
-                    hit = count >= self.restart_chunks
-                    stalled |= hit
-                    for c in np.where(hit)[0]:
-                        reasons.setdefault(int(c), []).append(nm_)
-                if stalled.any() and not stalled.all():
-                    best = int(np.argmax(np.where(stalled, -np.inf, logp_end)))
-                    bad = np.where(stalled)[0]
+            # Chains lagging on the likelihood restart from the top chain (until the draws start)
+            if self.restart_lagging_chains and C > 1 and adapting and lik_on and t_chunk <= self.restart_from_t:
+                lagging, lag_chunks = lagging_chains(ll_end, lag_chunks, self.restart_loglik_gap, self.restart_chunks)
+                if lagging.any():
+                    best = int(np.argmax(ll_end))
+                    bad = np.where(lagging)[0]
                     positions = positions.at[jnp.asarray(bad)].set(positions[best])
-                    step_size = np.where(stalled, step_size[best], step_size)
-                    step_size_nuis = np.where(stalled, step_size_nuis[best], step_size_nuis)
-                    for count in stall_chunks.values():
-                        count[stalled] = 0
+                    step_size = np.where(lagging, step_size[best], step_size)
+                    step_size_nuis = np.where(lagging, step_size_nuis[best], step_size_nuis)
                     for c in bad:
                         trace["restart_step"].append(s1)
                         trace["restart_chain"].append(int(c))
                         trace["restart_source"].append(best)
-                        trace["restart_reason"].append(",".join(reasons[int(c)]))
-                    why = "; ".join(f"chain {int(c)}: {'+'.join(reasons[int(c)])}" for c in bad)
+                        trace["restart_reason"].append("lagging")
+                    gaps = ", ".join(f"chain {int(c)}: {ll_end[best] - ll_end[c]:.0f}" for c in bad)
                     log(
-                        f"stalled for {self.restart_chunks} chunks ({why}): restarted from chain {best}'s state and step sizes "
-                        f"at step {s1} [{self.phase_of(s1)}]"
+                        f"log-likelihood more than {self.restart_loglik_gap:g} below chain {best}'s for {self.restart_chunks} chunks ({gaps}): "
+                        f"restarted from chain {best}'s state and step sizes at step {s1} [{self.phase_of(s1)}]"
                     )
+            else:
+                lag_chunks[:] = 0
 
             # Save model states
             if s1 % self.save_every == 0 or s1 == total:

@@ -104,6 +104,26 @@ def parameter_blocks(model, release_t, release_latest_t):
     return [b for b in blocks if len(b.idx)]
 
 
+
+# Chain restarts
+#####################################################################
+def lagging_chains(loglik, lag_chunks, gap, persist):
+    """
+    The chain restart test: which chains have had a log-likelihood more than
+    `gap` below the top chain's for `persist` consecutive chunks. `loglik`
+    (C,) is the chains' log-likelihood at the end of this chunk and
+    `lag_chunks` (C,) the consecutive chunks each has lagged so far. Returns
+    (lagging (C,) bool, updated lag_chunks); a lagging chain's count is reset
+    (it restarts from the top chain). The top chain never lags.
+    """
+    loglik = np.asarray(loglik, dtype=float)
+    behind = (loglik.max() - loglik) > gap
+    lag_chunks = np.where(behind, np.asarray(lag_chunks) + 1, 0)
+    lagging = lag_chunks >= persist
+    lag_chunks = np.where(lagging, 0, lag_chunks)
+    return lagging, lag_chunks
+
+
 # Prior energy offset
 #####################################################################
 def calibrate_prior_offset(model, scene_log, rng_key, n_sigmas=64):

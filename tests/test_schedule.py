@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from novamac.sampler import build_schedule
+from novamac.sampler import build_schedule, lagging_chains
 
 
 def test_schedule_without_plateau():
@@ -44,3 +44,18 @@ def test_plateau_needs_a_time():
         build_schedule(0.6, 4, 10, 3, plateau_at=None, plateau_steps=5)
     with pytest.raises(ValueError):
         build_schedule(0.6, 4, 10, 3, plateau_at=[0.5, 1.5], plateau_steps=5)
+
+
+def test_lagging_chains_restart_after_persisting():
+    counts = np.zeros(4, dtype=int)
+    ll = np.array([-100.0, -3000.0, -150.0, -2200.0])  # chains 1 and 3 more than 2000 behind chain 0
+    lagging, counts = lagging_chains(ll, counts, gap=2000.0, persist=2)
+    assert not lagging.any() and list(counts) == [0, 1, 0, 1], "one chunk behind is not enough"
+    lagging, counts = lagging_chains(ll, counts, gap=2000.0, persist=2)
+    assert list(lagging) == [False, True, False, True] and list(counts) == [0, 0, 0, 0], "second chunk: restart, counts reset"
+    ll = np.array([-100.0, -3000.0, -150.0, -1000.0])
+    lagging, counts = lagging_chains(ll, counts, gap=2000.0, persist=2)
+    assert not lagging.any() and list(counts) == [0, 1, 0, 0], "a chain back within the gap is cleared"
+    # the top chain never lags, however far the others are
+    lagging, counts = lagging_chains(np.array([-1e5, -1e5 - 5000]), np.array([5, 5]), gap=2000.0, persist=2)
+    assert list(lagging) == [False, True]
