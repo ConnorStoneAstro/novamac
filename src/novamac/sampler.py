@@ -124,6 +124,21 @@ def lagging_chains(loglik, lag_chunks, gap, persist):
     return lagging, lag_chunks
 
 
+def accept_copy(logp_source, logp_chain, u):
+    """
+    Metropolis test of a chain copy: the lagging chain is proposed the
+    source chain's state and takes it with probability
+    min(1, pi(source) / pi(chain)), the proposal treated as symmetric (the
+    source would be proposed the chain's state in the reverse move).
+    `logp_*` are the full annealed log densities of the two states at the
+    same t, `u` a uniform draw. Returns (accepted, log alpha).
+    """
+    log_alpha = float(logp_source) - float(logp_chain)
+    if not np.isfinite(log_alpha):
+        log_alpha = np.inf if np.isfinite(logp_source) else -np.inf  # a finite state beats a non-finite one
+    return bool(np.log(u) < log_alpha), log_alpha
+
+
 # Prior energy offset
 #####################################################################
 def calibrate_prior_offset(model, scene_log, rng_key, n_sigmas=64):

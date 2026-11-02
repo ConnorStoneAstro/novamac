@@ -622,6 +622,64 @@ def make_chunk_runner(
     return jax.jit(jax.vmap(single_chain, in_axes=(0, 0, 0, 0, None, None, None, None, None, None)))
 
 
+# Re-noise move
+#####################################################################
+def make_renoise_fn(target, broaden_fn, sigma_fn, scene_mask, residual_var_fn=None, max_abs_scene=jnp.inf):
+    """
+    Jitted, chain-vmapped Metropolis move that redraws the scene's noise:
+
+        renoise(keys, x, t, jj) -> (x, accepted, log_alpha, logdensity)
+
+    The proposal takes the Tweedie estimate of the clean scene at the
+    current state, D(x) = x + sigma_t^2 * score(x), and noises it back up
+    to the current level, x' = D(x) + w_t * eps on the scene coordinates
+    (the others unchanged), with w_t^2 = sigma_t^2 + residual_var_fn(t). It
+    is accepted with the exact Metropolis ratio
+
+        pi_t(x') q(x | x') / (pi_t(x) q(x' | x)),
+
+    q(. | y) the Gaussian of width w_t about D(y), so the reverse density is
+    evaluated at D(x').
+
+    residual_var_fn(t) is the denoiser's residual variance, the scatter of
+    the clean scene about its Tweedie estimate (the broadening's log
+    variance, sigma^2 s^2 / (sigma^2 + s^2) with s the prior's data scale;
+    None = 0). With it the proposal is, for a Gaussian prior, exactly the
+    Gibbs move "draw the clean scene given x_t, then noise it to sigma_t",
+    accepted always; without it the proposal contracts onto D(x) and the
+    ratio rejects it once sigma_t is small against the number of pixels.
+    The point of the move is a chain stuck with a poor noise realisation:
+    the proposal depends on x only through D(x), so the noise is replaced
+    wholesale instead of being diffused away pixel by pixel by HMC steps
+    that are tiny at large sigma_t. The scene is clipped to
+    |x| <= max_abs_scene like the leapfrog's box; the proposal densities
+    use the clipped values.
+    """
+    scene_mask = jnp.asarray(scene_mask)
+    bound = jnp.asarray(max_abs_scene)
+
+    def single(key, x, t, jj):
+        extra_var = broaden_fn(t) * jj
+        s = sigma_fn(t)
+        w = jnp.sqrt(s**2 + (residual_var_fn(t) if residual_var_fn is not None else 0.0))
+        ll0, lp0, _, score0 = target.parts(x, t, extra_var)
+        d0 = x + s**2 * score0 * scene_mask
+        key_eps, key_u = jax.random.split(key)
+        eps = jax.random.normal(key_eps, x.shape, x.dtype)
+        x1 = jnp.where(scene_mask > 0, jnp.clip(d0 + w * eps, -bound, bound), x)
+        ll1, lp1, _, score1 = target.parts(x1, t, extra_var)
+        d1 = x1 + s**2 * score1 * scene_mask
+        log_q_fwd = -0.5 * jnp.sum((((x1 - d0) * scene_mask) / w) ** 2)
+        log_q_rev = -0.5 * jnp.sum((((x - d1) * scene_mask) / w) ** 2)
+        log_alpha = (ll1 + lp1) - (ll0 + lp0) + log_q_rev - log_q_fwd
+        log_alpha = jnp.where(jnp.isfinite(log_alpha), log_alpha, -jnp.inf)
+        accept = jnp.log(jax.random.uniform(key_u, dtype=x.dtype)) < log_alpha
+        x = jnp.where(accept, x1, x)
+        return x, accept, log_alpha, jnp.where(accept, ll1 + lp1, ll0 + lp0)
+
+    return jax.jit(jax.vmap(single, in_axes=(0, 0, None, None)))
+
+
 # Score diagnostics
 #####################################################################
 def make_score_fn(target, broaden_fn, scene_idx):

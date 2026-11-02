@@ -59,3 +59,19 @@ def test_lagging_chains_restart_after_persisting():
     # the top chain never lags, however far the others are
     lagging, counts = lagging_chains(np.array([-1e5, -1e5 - 5000]), np.array([5, 5]), gap=2000.0, persist=2)
     assert list(lagging) == [False, True]
+
+
+def test_accept_copy_is_a_metropolis_test():
+    from novamac.sampler import accept_copy
+
+    # a source with the higher density is always taken
+    accepted, log_alpha = accept_copy(-100.0, -5000.0, u=0.999)
+    assert accepted and log_alpha == 4900.0
+    # a source below the chain's density is taken with probability exp(log_alpha)
+    accepted, log_alpha = accept_copy(-110.0, -100.0, u=np.exp(-10.0) * 0.5)
+    assert accepted and log_alpha == -10.0
+    accepted, _ = accept_copy(-110.0, -100.0, u=np.exp(-10.0) * 2.0)
+    assert not accepted
+    # a finite source always replaces a non-finite chain, never the reverse
+    assert accept_copy(-100.0, -np.inf, u=0.999)[0]
+    assert not accept_copy(-np.inf, -100.0, u=1e-9)[0]

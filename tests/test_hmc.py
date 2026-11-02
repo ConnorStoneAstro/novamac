@@ -290,3 +290,44 @@ def test_nuisance_step_trace_describes_the_returned_state(toy):
     lp_true = np.array([float(toy["log_lik"](x[c], ev) + toy["log_prior"](x[c], 0.0)) for c in range(C)])
     assert np.allclose(np.asarray(tr["logdensity"])[:, -1], lp_true, rtol=1e-4, atol=1e-3)
     assert np.allclose(np.asarray(tr["loglik"])[:, -1], [float(toy["log_lik"](x[c], ev)) for c in range(C)], rtol=1e-4, atol=1e-3)
+
+
+def test_renoise_move_keeps_a_gaussian_target_invariant():
+    """A Gaussian prior on x_t: clean pixels ~ N(0, 1), so x_t ~ N(0, 1 + sigma^2),
+    the Tweedie estimate is x / (1 + sigma^2) and the clean scene scatters by
+    sigma^2 / (1 + sigma^2) about it (the residual variance with s = 1). With
+    that residual the re-noise proposal is the exact Gibbs move and is always
+    accepted; many moves on many chains must leave the N(0, 1 + sigma^2)
+    marginal in place and relax a cold start to it. Without the residual the
+    proposal contracts onto the Tweedie estimate and is mostly rejected."""
+    from novamac.hmc import Target, make_renoise_fn
+
+    sigma = 0.8
+    dim, n_scene, chains, moves = 6, 4, 2000, 20
+    scene_mask = jnp.asarray([1.0] * n_scene + [0.0] * (dim - n_scene))
+    sigma_fn = lambda t: sigma  # noqa: E731
+    var_t = 1.0 + sigma**2
+    log_prior = lambda x, t: -0.5 * jnp.sum(scene_mask * x**2) / var_t  # noqa: E731
+    log_lik = lambda x, ev: 0.0 * jnp.sum(x)  # noqa: E731
+    target = Target(log_lik, log_prior, sigma_fn, scene_mask, tweedie=True)
+    residual = lambda t: sigma**2 / var_t  # noqa: E731  (var(clean | x_t) for s = 1)
+    renoise = make_renoise_fn(target, lambda t: 0.0, sigma_fn, scene_mask, residual)
+    key = jax.random.key(3)
+    # start far from the target: every scene pixel at +4
+    x0 = jnp.concatenate([jnp.full((chains, n_scene), 4.0), jnp.ones((chains, dim - n_scene))], axis=1)
+    x, accepted = x0, []
+    for _ in range(moves):
+        key, k = jax.random.split(key)
+        x, acc, log_alpha, _ = renoise(jax.random.split(k, chains), x, 0.5, jnp.zeros(1))
+        assert bool(jnp.all(jnp.isfinite(log_alpha)))
+        accepted.append(float(acc.mean()))
+    scene = np.asarray(x[:, :n_scene])
+    assert min(accepted) > 0.95, "the Gibbs proposal is (numerically) always accepted"
+    assert abs(scene.mean()) < 0.05, "relaxed from the cold start"
+    assert abs(scene.var() / var_t - 1.0) < 0.05, "the marginal of x_t is N(0, 1 + sigma^2)"
+    assert np.allclose(np.asarray(x[:, n_scene:]), 1.0), "non-scene coordinates untouched"
+    # the bare re-noise (no residual scatter) is a valid but poor proposal
+    bare = make_renoise_fn(target, lambda t: 0.0, sigma_fn, scene_mask)
+    key, k = jax.random.split(key)
+    _, acc, _, _ = bare(jax.random.split(k, chains), x, 0.5, jnp.zeros(1))
+    assert float(acc.mean()) < 0.8

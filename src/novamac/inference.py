@@ -78,6 +78,7 @@ from .hmc import (
     make_log_parts,
     make_log_variance_fn,
     make_nuisance_log_prior,
+    make_renoise_fn,
     make_score_fn,
     make_sigma_fn,
     make_target,
@@ -98,6 +99,7 @@ from .init_scene import (
 from .psf import fit_moffat_psfs
 from .products import RunFiles
 from .sampler import (
+    accept_copy,
     build_schedule,
     calibrate_prior_offset,
     find_initial_step_size,
@@ -128,16 +130,18 @@ class Novamac:
     num_integration_steps = 8  # leapfrog steps per HMC transition on the scene
 
     # Prior noise level sigma(t) at which the schedule starts (the warmup
-    # target). None means t = 1, i.e. sigma_max. Starting from full prior noise
-    # does not work with a log-flux scene: once sigma_t >~ 2 the chain holds
-    # pixels many e-folds from the data and the likelihood penalty on them grows
-    # doubly exponentially as t decreases, the step size collapses and the chain
-    # freezes. sigma ~ 1 (one e-fold of pixel noise) is broad but recoverable.
-    sigma_start = 1.0
+    # target). None means t = 1, i.e. sigma_max: full prior noise. That works
+    # with the Tweedie-denoised likelihood (the data see the denoised scene,
+    # so the noisy pixels cost nothing); with the likelihood on the noisy
+    # scene itself a start above sigma ~ 2 froze the chains (pixels many
+    # e-folds from the data, a doubly exponential penalty as t decreases).
+    sigma_start = None
     warmup_steps = 256  # at t = t_start, HMC only
-    anneal_steps = 4096  # t from t_start down to 0, predictor + corrector
-    plateau_at = 0.5  # fraction(s) of t_start at which the anneal pauses (when plateau_steps > 0): a number or a sequence
-    plateau_steps = 0  # steps at each fixed t inside the anneal; the anneal phase is anneal_steps + plateau_steps * (number of plateaus) long
+    anneal_steps = 4096  # t from t_start down to 0 (plateaus excluded)
+    # fraction(s) of t_start at which the anneal pauses (when plateau_steps > 0):
+    # a number or a sequence; the default is ten evenly spaced pauses
+    plateau_at = tuple(k / 11.0 for k in range(10, 0, -1))
+    plateau_steps = 512  # steps at each fixed t inside the anneal; the anneal phase is anneal_steps + plateau_steps * (number of plateaus) long
     hold_steps = 512  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
     # The step sizes keep adapting for this many chunks of the hold (the cut at
     # the hold start is a guess) and are then frozen, chain restarts stop, and
@@ -162,8 +166,19 @@ class Novamac:
     # Predictor on/off (corrector-only annealing when False: HMC alone tracks the
     # moving target), and its noise: fraction of the reverse-SDE noise (1 =
     # reverse SDE, 0 = probability-flow ODE); the drift is scaled accordingly.
-    predictor = True
+    # Off: the anneal moves slowly enough per step for HMC to follow, and the
+    # unadjusted predictor step was suspected of pushing the scene the wrong way.
+    predictor = False
     predictor_noise = 0.0
+    # Every renoise_every steps (a multiple of chunk_steps) each chain is
+    # proposed a fresh noise realisation of its scene: the Tweedie estimate of
+    # the clean scene noised back up to sigma_t (plus the denoiser's residual
+    # scatter, which makes it a Gibbs move for a Gaussian prior), accepted by
+    # the exact Metropolis ratio (hmc.make_renoise_fn). Gives a chain that
+    # started on a bad noise realisation a way out early on. Warmup and anneal
+    # only (not in the hold, where sigma_t is sigma_min and the Tweedie shift is off).
+    renoise_scene = True
+    renoise_every = 256
 
     # Mass matrix: inv_mass(t) = inv_mass0 + mass_sigma_fraction * sigma(t)^2 on
     # the scene. 0.5 is the width the product of two factors each convolved to
@@ -227,20 +242,21 @@ class Novamac:
     nuisance_integration_steps = 10
     # A chain that has fallen behind the others on the data (its log-likelihood
     # more than restart_loglik_gap below the top chain's at the end of
-    # restart_chunks consecutive chunks) is restarted from the top chain's
-    # state and step sizes. Only from t <= restart_from_t on: earlier the
-    # likelihood is still broadened and healthy chains sit thousands apart (in
-    # the mock runs the spread across chains falls from ~2000 at t_start to
-    # <100 by t = 0.2). The likelihood, not the density: the prior energy of
-    # the margin pixels differs by ~1e4 between chains that agree on the data,
-    # and a chain in a sharp healthy mode has a small step size, so neither
-    # the density nor the step size tells a bad chain from a good one. Restarts
-    # stop when the draws start. A restarted chain shares its past with its
-    # source, so the chains are no longer independent; prefer that to a chain
-    # stuck in a bad mode.
+    # restart_chunks consecutive chunks) is proposed the top chain's state
+    # and step sizes, and takes them with the Metropolis probability
+    # min(1, pi_t(top) / pi_t(chain)) on the full annealed density
+    # (sampler.accept_copy): a chain that is behind on the data but ahead on
+    # the prior by more keeps its state. Only from t <= restart_from_t on:
+    # earlier the likelihood is still broadened and healthy chains sit far
+    # apart on it. The trigger uses the likelihood, not the density, because
+    # the prior energy of the margin pixels differs by ~1e4 between chains
+    # that agree on the data; the test uses the density because that is the
+    # target. Restarts stop when the draws start. A restarted chain shares
+    # its past with its source, so the chains are no longer independent;
+    # prefer that to a chain stuck in a bad mode.
     restart_lagging_chains = True
     restart_loglik_gap = 2000.0
-    restart_from_t = 0.35
+    restart_from_t = 0.7
     restart_chunks = 2
     # The host prior's per-pixel energy level is subtracted inside its sum
     # (model.meta.prior_energy_offset, a function of sigma; see build_prior):
@@ -1223,11 +1239,18 @@ class Novamac:
             "probe_block": [],
             "probe_step": [],
             "probe_ratio": [],
-            # chain restarts: (step, chain restarted, chain it was copied from, reason)
+            # chain restarts: (step, chain restarted, chain it was copied from, reason,
+            # whether the Metropolis test accepted the copy, its log ratio)
             "restart_step": [],
             "restart_chain": [],
             "restart_source": [],
             "restart_reason": [],
+            "restart_accept": [],
+            "restart_log_alpha": [],
+            # re-noise proposals: step, and per chain whether it was accepted and its log ratio
+            "renoise_step": [],
+            "renoise_accept": [],
+            "renoise_log_alpha": [],
         }  # fmt: skip
         self.trace = trace
 
@@ -1277,6 +1300,22 @@ class Novamac:
             True: make_score_fn(target, broaden_fn, scene_idx),
             False: make_score_fn(target_off, broaden_fn, scene_idx),
         }
+        renoise_fns = {}
+        if self.renoise_scene and self.renoise_every:
+            if self.renoise_every % self.chunk_steps != 0:
+                raise ValueError("renoise_every must be a multiple of chunk_steps")
+            # the proposal's extra width: the denoiser's residual variance (the
+            # Tweedie broadening's log variance) when the likelihood sees the
+            # denoised scene, nothing when it sees the noisy scene itself
+            residual_var_fn = make_log_variance_fn(sde, float(data_std)) if tweedie else None
+            renoise_fns = {
+                True: make_renoise_fn(target, broaden_fn, sigma_fn, scene_mask_dev, residual_var_fn, self.max_abs_log_scene),
+                False: make_renoise_fn(target_off, broaden_fn, sigma_fn, scene_mask_dev, residual_var_fn, self.max_abs_log_scene),
+            }
+            log(
+                f"re-noise proposal on the scene every {self.renoise_every} steps until the hold"
+                + (f" (proposal width^2 = sigma_t^2 + the Tweedie residual variance)" if tweedie else "")
+            )
         curvature_fns = {
             b.name: make_block_curvature_fn(target, broaden_fn, b.groups) for b in blocks
         }
@@ -1487,9 +1526,26 @@ class Novamac:
                     trace["cond_mean"][ci] = np.asarray(c_mean)
                     trace["cond_cov"][ci] = np.asarray(c_cov)
 
+            # Re-noise proposal: the Tweedie estimate noised back up to sigma_t
+            if renoise_fns and s1 % self.renoise_every == 0 and s1 < hold_start and t_chunk > 0:
+                rng, key = jax.random.split(rng)
+                with Timer("renoise", timings, quiet=True):
+                    positions, rn_acc, rn_la, _ = renoise_fns[lik_on](
+                        jax.random.split(key, C), positions, t_chunk, jj_dev
+                    )
+                    jax.block_until_ready(positions)
+                rn_acc, rn_la = np.asarray(rn_acc), np.asarray(rn_la)
+                trace["renoise_step"].append(s1)
+                trace["renoise_accept"].append(rn_acc)
+                trace["renoise_log_alpha"].append(rn_la)
+                log(
+                    f"re-noise proposal at step {s1} (t={t_chunk:.3f}): accepted {np.array2string(rn_acc.astype(int))}, "
+                    f"log alpha {np.array2string(rn_la, precision=1)}"
+                )
+
             # Diagnostics at the end of the chunk, with the parameters used in it;
             # the log density is that of the state the chunk ends on (after the
-            # Gibbs refresh), which is what the restart check below compares
+            # Gibbs refresh and the re-noise move), which is what the restart check below compares
             with Timer("scores", timings, quiet=True):
                 scores, logp_post = score_fns[lik_on](
                     positions, t_chunk, jj_dev, as_dev(inv_mass_at(t_chunk))
@@ -1531,24 +1587,38 @@ class Novamac:
                     + "; no more adaptation or restarts, the states saved from here on are the posterior draws"
                 )
 
-            # Chains lagging on the likelihood restart from the top chain (until the draws start)
+            # Chains lagging on the likelihood are proposed the top chain's state
+            # (Metropolis on the full density; until the draws start)
             if self.restart_lagging_chains and C > 1 and adapting and lik_on and t_chunk <= self.restart_from_t:
                 lagging, lag_chunks = lagging_chains(ll_end, lag_chunks, self.restart_loglik_gap, self.restart_chunks)
                 if lagging.any():
                     best = int(np.argmax(ll_end))
-                    bad = np.where(lagging)[0]
-                    positions = positions.at[jnp.asarray(bad)].set(positions[best])
-                    step_size = np.where(lagging, step_size[best], step_size)
-                    step_size_nuis = np.where(lagging, step_size_nuis[best], step_size_nuis)
-                    for c in bad:
+                    rng, key = jax.random.split(rng)
+                    u = np.asarray(jax.random.uniform(key, (C,)))
+                    taken = np.zeros(C, dtype=bool)
+                    outcome = []
+                    for c in np.where(lagging)[0]:
+                        accepted, log_alpha = accept_copy(logp_end[best], logp_end[c], u[c])
+                        taken[c] = accepted
                         trace["restart_step"].append(s1)
                         trace["restart_chain"].append(int(c))
                         trace["restart_source"].append(best)
                         trace["restart_reason"].append("lagging")
-                    gaps = ", ".join(f"chain {int(c)}: {ll_end[best] - ll_end[c]:.0f}" for c in bad)
+                        trace["restart_accept"].append(accepted)
+                        trace["restart_log_alpha"].append(log_alpha)
+                        outcome.append(
+                            f"chain {int(c)}: likelihood {ll_end[best] - ll_end[c]:.0f} behind, log density ratio {log_alpha:+.0f}, "
+                            + ("copied" if accepted else "kept its state")
+                        )
+                    if taken.any():
+                        positions = positions.at[jnp.asarray(np.where(taken)[0])].set(positions[best])
+                        step_size = np.where(taken, step_size[best], step_size)
+                        step_size_nuis = np.where(taken, step_size_nuis[best], step_size_nuis)
+                        logp_end = np.where(taken, logp_end[best], logp_end)
+                        trace["chunk_logdensity"][ci] = logp_end
                     log(
-                        f"log-likelihood more than {self.restart_loglik_gap:g} below chain {best}'s for {self.restart_chunks} chunks ({gaps}): "
-                        f"restarted from chain {best}'s state and step sizes at step {s1} [{self.phase_of(s1)}]"
+                        f"log-likelihood more than {self.restart_loglik_gap:g} below chain {best}'s for {self.restart_chunks} chunks at step {s1} "
+                        f"[{self.phase_of(s1)}], proposed chain {best}'s state and step sizes: " + "; ".join(outcome)
                     )
             else:
                 lag_chunks[:] = 0

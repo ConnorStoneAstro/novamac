@@ -54,6 +54,11 @@ def test_posterior_run_plots_and_diagnostics(tmp_path, prior_dir, synthetic):
     frozen = trace["chunk_step"] >= expected
     assert np.all(trace["step_size"][n_chunks - 1] == trace["step_size"][np.argmax(frozen)]) if frozen.any() else True
     assert all(int(st) <= expected for st in trace["restart_step"])
+    # the re-noise proposals: at every renoise_every steps before the hold, with a finite ratio per chain
+    rn = np.asarray(trace["renoise_step"], dtype=int)
+    assert list(rn) == [st for st in range(s["renoise_every"], hold_start, s["renoise_every"])]
+    assert np.asarray(trace["renoise_accept"]).shape == (len(rn), s["num_chains"])
+    assert np.all(np.isfinite(np.asarray(trace["renoise_log_alpha"])))
     assert np.all(np.isfinite(trace["chunk_logdensity"]))
 
     paths = nm.plot_all(raise_errors=True)
