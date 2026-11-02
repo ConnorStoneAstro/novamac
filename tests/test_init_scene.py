@@ -10,6 +10,7 @@ from novamac.sampler import flat_data_weight
 from novamac.init_scene import (
     aperture_fluxes,
     border_sky,
+    difference_fluxes,
     fill_uncovered,
     moffat_enclosed,
     moffat_fwhm,
@@ -297,3 +298,49 @@ def test_masked_nan_does_not_reach_the_flat_data(prior_dir, synthetic, tmp_path)
     nm = Novamac(prior=prior_dir, out_dir=tmp_path, verbose=False, **bad)
     data, weight = flat_data_weight(nm.build_model())
     assert np.all(np.isfinite(data)) and np.all(weight[~np.isfinite(bad["data"].ravel())] == 0)
+
+
+def test_difference_fluxes_recover_a_point_source():
+    """Aligned epochs of a smooth host plus a Gaussian point source in the
+    transient epochs: the matched difference recovers the fluxes, templates
+    get zero, and a non-positive epoch is interpolated in mjd."""
+    rng = np.random.default_rng(1)
+    n, scale, pix = 31, 0.2, 0.1
+    H = W = 80
+    r, c = np.mgrid[:H, :W]
+    x = (c - (W - 1) / 2) * pix
+    y = (r - (H - 1) / 2) * pix
+    host = 40 * np.exp(-(x**2 + y**2) / (2 * 1.2**2)) + 5  # surface brightness, with a pedestal
+    N = 8
+    is_template = np.array([True] * 4 + [False] * 4)
+    fwhm_px = np.array([3.0, 3.6, 3.2, 3.4, 3.1, 4.0, 3.3, 3.5])
+    psf_n = np.full(N, 3.0)
+    psf_Rd = fwhm_px / (2.0 * np.sqrt(2.0 ** (1.0 / 3.0) - 1.0))  # Moffat Rd with that FWHM
+    truth_flux = np.array([0, 0, 0, 0, 300.0, 120.0, 0.0, 60.0])
+    mjd = np.array([0, 1, 2, 3, 10, 12, 14, 16], dtype=float)
+    crpix = np.tile([(n - 1) / 2, (n - 1) / 2], (N, 1))
+    crtan = np.zeros((N, 2))
+    CD = np.tile(np.eye(2) * scale, (N, 1, 1))
+    row, col = np.mgrid[:n, :n]
+    xx = (col - crpix[0, 0]) * scale
+    yy = (row - crpix[0, 1]) * scale
+    area = scale**2
+    sky = 2.0
+    data = np.zeros((N, n, n))
+    for i in range(N):
+        sb = _bilinear(host, yy / pix + (H - 1) / 2, xx / pix + (W - 1) / 2)
+        d2 = (col - crpix[i, 0]) ** 2 + (row - crpix[i, 1]) ** 2
+        psf = (1.0 + d2 / psf_Rd[i] ** 2) ** (-psf_n[i])  # the epoch's Moffat
+        data[i] = sb * area + sky + truth_flux[i] * psf / psf.sum() + rng.normal(0, 0.3, (n, n))
+    weight = np.full((N, n, n), 1 / 0.3**2)
+    mask = np.zeros((N, n, n), bool)
+    stack, count, _, _ = stack_templates(data, weight, mask, is_template, crpix, crtan, CD, (H, W), pix, (0.0, 0.0), np.full(N, sky))
+    flux, err, diff = difference_fluxes(data, weight, mask, is_template, crpix, crtan, CD, stack, pix, (0.0, 0.0), (0.0, 0.0),
+                                        np.full(N, sky), psf_n, psf_Rd, mjd=mjd)
+    assert np.all(flux[is_template] == 0)
+    assert abs(flux[4] / 300 - 1) < 0.1 and abs(flux[5] / 120 - 1) < 0.15, (flux, err)
+    assert np.all(err[~is_template] > 0)
+    assert flux[6] > 0, "a non-positive epoch is replaced"
+    assert diff.shape == data.shape and np.all(np.isfinite(diff))
+    # the host cancels: the difference is flat away from the source in a template
+    assert abs(diff[0].mean()) < 0.2

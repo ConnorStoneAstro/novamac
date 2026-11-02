@@ -89,6 +89,7 @@ from .init_scene import (
     border_sky,
     cd_arcsec,
     data_pixel_scale,
+    difference_fluxes,
     moffat_fwhm,
     prepare_initial_scene,
     source_pixel_position,
@@ -346,8 +347,19 @@ class Novamac:
     init_sky_border = 5
     init_min_templates = 4
     init_subsample = 5
-    # Aperture for the initial point-source fluxes when none are given:
-    # radius in units of the Moffat FWHM (the enclosed fraction is corrected).
+    # Initial point-source fluxes when none are given. init_flux_method
+    # "difference": like a difference-imaging pipeline, the raw template stack
+    # is resampled into each epoch, epoch and template are PSF-matched to a
+    # Gaussian init_psf_match x the broadest epoch's, and a point source plus
+    # a flat background is fitted to the difference within init_fit_fwhm x
+    # the matched FWHM (init_scene.difference_fluxes); non-positive transient
+    # epochs take the value interpolated in mjd from the positive ones.
+    # "model": aperture photometry (init_aperture_fwhm x the Moffat FWHM) of
+    # the data minus the raw stack rendered through the forward model (the
+    # stack is PSF-blurred already, so the host is blurred twice).
+    init_flux_method = "difference"
+    init_psf_match = 1.1
+    init_fit_fwhm = 1.0
     init_aperture_fwhm = 1.5
     # Initial alignment (align.py): once the initial scene and fluxes exist,
     # each image's crtan takes init_align_steps Adam steps of init_align_rate
@@ -633,10 +645,14 @@ class Novamac:
         self._border = (
             border_sky(self.data, self.mask, self.init_sky_border) if self.init_sky_border else None
         )
+        # the model's sky is a surface brightness (flux per arcsec^2); the
+        # stack subtracts it per data pixel (self._sky_px), so the initial scene
+        # carries whatever diffuse light the sky does not. The border median is
+        # only the default sky when none is given.
+        area = np.abs(np.linalg.det(cd_arcsec(self.CD)))
         if self.sky is None:
-            # the model's sky is a surface brightness (flux per arcsec^2)
-            area = np.abs(np.linalg.det(cd_arcsec(self.CD)))
             self.sky = np.zeros(self.n_images) if self._border is None else self._border / area
+        self._sky_px = self.sky * area
         self.crtan_init = self.crtan.copy()
         scene, info = self._initial_scene(self.crtan)
         self.init_info = info
@@ -656,7 +672,7 @@ class Novamac:
         return prepare_initial_scene(
             self.data, self.weight, self.mask, self.is_template, self.crpix, crtan, self.CD, self.scene_shape,
             self.scene_pixel_scale, self.ps_center[0], scene_scale=self.scene_scale0, softening=self.prior.transform.softening,
-            prior_scene_factor=self.prior_scene_factor, init_image=self.init_image, sky=self._border,
+            prior_scene_factor=self.prior_scene_factor, init_image=self.init_image, sky=self._sky_px,
             threshold_sigma=self.init_threshold_sigma, fill_sigma=self.init_fill_sigma, min_templates=self.init_min_templates,
             subsample=self.init_subsample,
         )  # fmt: skip
@@ -686,7 +702,7 @@ class Novamac:
             self.align_info = refine_alignment(
                 self._leave_one_out_stacks(self.crtan), self.data, self.weight, self.mask | self._transient_aperture(),
                 self.crpix, self.crtan, self.CD,
-                self.ps_center[0], self.scene_pixel_scale, sky=None if self._border is None else self._border,
+                self.ps_center[0], self.scene_pixel_scale, sky=self._sky_px,
                 max_shift=self.init_align_max_shift, steps=self.init_align_steps, rate=self.init_align_rate,
                 pixel_scale=self.data_pixel_scale, min_dchi2=self.init_align_min_dchi2,
             )  # fmt: skip
@@ -731,7 +747,7 @@ class Novamac:
             others[n] = False
             out[n] = stack_templates(
                 self.data, self.weight, self.mask, others, self.crpix, crtan, self.CD, self.scene_shape, self.scene_pixel_scale,
-                self.ps_center[0], self._border, min_templates=1, subsample=self.init_subsample,
+                self.ps_center[0], self._sky_px, min_templates=1, subsample=self.init_subsample,
             )[0]  # fmt: skip
         return out
 
@@ -749,12 +765,14 @@ class Novamac:
         return out
 
     def _estimate_fluxes(self, model):
-        """Aperture photometry of the data minus the rendered initial scene
-        and sky, per source and image; epochs without a detection start at
-        their aperture noise (positive, and the centre of the log-flux prior).
-        The scene rendered here is the raw stack (before the soft threshold
-        and the prior's transform, which both move faint pixels), so the
-        residual is unbiased where the host is faint."""
+        """The initial point-source fluxes per source and image (see
+        init_flux_method); epochs without a detection start positive (the
+        centre of the log-flux prior). Templates get 1 (their flux is fixed
+        at zero by the template indicator)."""
+        if self.init_flux_method == "difference":
+            return self._difference_fluxes()
+        if self.init_flux_method != "model":
+            raise ValueError(f"init_flux_method must be 'difference' or 'model', got {self.init_flux_method!r}")
         pix = model.models.pixelated_batch_model.model
         prepared = np.array(pix.I.npvalue)
         raw = np.asarray(self.init_info["raw"], dtype=float) / self.scene_scale0
@@ -777,6 +795,27 @@ class Novamac:
             log(
                 f"initial flux of source {p} from aperture photometry ({self.init_aperture_fwhm:g} FWHM): "
                 f"{np.array2string(flux[sn], precision=3)} +- {np.array2string(err[sn], precision=3)} on the {int(sn.sum())} transient epochs"
+            )
+        return fluxes
+
+    def _difference_fluxes(self):
+        """init_flux_method "difference": init_scene.difference_fluxes on the
+        raw template stack with each epoch's Moffat PSF."""
+        fluxes = np.ones((self.n_sources, self.n_images))
+        sn = ~self.is_template
+        for p in range(self.n_sources):
+            flux, err, _ = difference_fluxes(
+                self.data, self.weight, self.mask, self.is_template, self.crpix, self.crtan_init, self.CD, self.init_info["raw"],
+                self.scene_pixel_scale, self.ps_center[0], self.ps_center[p], self._sky_px, self.psf_n, self.psf_Rd, mjd=self.mjd,
+                radius_factor=self.init_fit_fwhm, match_factor=self.init_psf_match,
+            )  # fmt: skip
+            est = np.where(np.isfinite(flux) & (flux > 0), flux, 1.0)
+            fluxes[p] = np.where(self.is_template, 1.0, est)
+            log(
+                f"initial flux of source {p} from the matched difference images (template = raw stack resampled per epoch, "
+                f"PSF matched to {self.init_psf_match:g} x the broadest epoch, point source + background fitted within {self.init_fit_fwhm:g} FWHM; "
+                f"non-positive epochs interpolated in mjd): {np.array2string(flux[sn], precision=3)} "
+                f"+- {np.array2string(err[sn], precision=3)} on the {int(sn.sum())} transient epochs"
             )
         return fluxes
 

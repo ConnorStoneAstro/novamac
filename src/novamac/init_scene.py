@@ -320,6 +320,102 @@ def aperture_fluxes(residual, weight, mask, crpix, crtan, CD, position, psf_n, p
     return flux, err
 
 
+def difference_fluxes(data, weight, mask, is_template, crpix, crtan, CD, stack, pix_scale, center, position, sky_px, psf_n, psf_Rd,
+                      mjd=None, radius_factor=1.0, match_factor=1.1, sub=3, psf_sub=5):
+    """
+    Initial point-source fluxes the way a difference-imaging pipeline gets
+    them: the template (the raw stack of the template epochs, surface
+    brightness on the scene grid, sky subtracted) is resampled into every
+    epoch's pixel grid through its WCS, both the epoch and the template are
+    PSF-matched to a common, slightly broader Gaussian (sigma_T =
+    match_factor x the broadest epoch's Gaussian-equivalent sigma; the
+    template's own width is the quadrature mean of the template epochs'),
+    and on the difference (data - sky_px - template) the epoch's matched PSF
+    (its circular Moffat, psf_n / psf_Rd in data pixels, smoothed by the same
+    kernel as the data, unit flux) plus a flat background is fitted by
+    weighted least squares to the pixels within radius_factor x the matched
+    FWHM (at least 2.5 px) of the source. Fitting the matched Moffat rather
+    than a Gaussian keeps the wings' flux: for a broad-winged PSF a Gaussian
+    core of the same FWHM holds only half of it. The background term matters: in a broad-seeing epoch the PSF
+    scatters light from outside the cutout (bright neighbours, the host's
+    outskirts) across the whole cutout, which the template, built from
+    sharper epochs' cutouts, cannot contain; a plain aperture sum takes it
+    as flux (thousands of nJy at FWHM ~ 10 px in the mocks). sky_px (N,) is
+    the per-pixel sky.
+    Masked pixels are left out of the fit (and replaced by the template
+    before the smoothing so they do not bleed in).
+
+    Returns (flux, err, diff) with flux (N,) (zero on the templates), err
+    the fit's formal error from the weights (the smoothing correlates the
+    noise, so it is an underestimate), and diff (N, H, W) the matched
+    difference images. A transient epoch whose flux is not positive takes
+    the value linearly interpolated in `mjd` from the positive epochs (the
+    difference-imaging light-curve convention); without `mjd`, or without
+    any positive epoch, it takes its error.
+    """
+    from .align import resample_scene  # here, not at the top: align imports this module
+
+    data = np.asarray(data, dtype=float)
+    weight = np.asarray(weight, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+    is_template = np.asarray(is_template, dtype=bool)
+    psf_n, psf_Rd = np.asarray(psf_n, dtype=float), np.asarray(psf_Rd, dtype=float)
+    fwhm_px = moffat_fwhm(psf_n, psf_Rd)
+    sky_px = np.asarray(sky_px, dtype=float)
+    CD = cd_arcsec(CD)
+    N, H, W = data.shape
+    sig = fwhm_px / 2.3548  # Gaussian-equivalent sigma per epoch, data px
+    sig_template = np.sqrt(np.mean(sig[is_template] ** 2)) if is_template.any() else np.sqrt(np.mean(sig**2))
+    sig_T = match_factor * max(sig.max(), sig_template)
+    r_fit = max(radius_factor * 2.3548 * sig_T, 2.5)
+    pos = source_pixel_position(crpix, crtan, CD, position)
+    rows, cols = np.mgrid[:H, :W]
+    flux, err = np.zeros(N), np.zeros(N)
+    diff = np.zeros((N, H, W))
+    for n in range(N):
+        template = np.asarray(resample_scene(stack, crpix[n], crtan[n], CD[n], center, float(pix_scale), (H, W), sub=sub), dtype=float)
+        img = data[n] - sky_px[n]
+        usable = ~mask[n] & np.isfinite(img) & np.isfinite(weight[n]) & (weight[n] > 0)
+        img = np.where(usable, img, template)  # masked pixels take the template: no bleed into the smoothing
+        k_img = np.sqrt(max(sig_T**2 - sig[n] ** 2, 0.0))
+        k_tmp = np.sqrt(max(sig_T**2 - sig_template**2, 0.0))
+        img_m = gaussian_smooth(img, k_img) if k_img > 1e-3 else img
+        tmp_m = gaussian_smooth(template, k_tmp) if k_tmp > 1e-3 else template
+        diff[n] = img_m - tmp_m
+        d2 = (cols - pos[n, 0]) ** 2 + (rows - pos[n, 1]) ** 2
+        inside = (d2 <= r_fit**2) & usable
+        if is_template[n] or inside.sum() < 3:
+            continue
+        # the epoch's Moffat integrated over each pixel (psf_sub x psf_sub
+        # samples: a PSF of ~1 px FWHM evaluated at pixel centres alone
+        # overstates its peak and the fitted flux comes out low)
+        off = (np.arange(psf_sub) + 0.5) / psf_sub - 0.5
+        dr, dc = np.meshgrid(off, off, indexing="ij")
+        d2_sub = (cols[..., None] + dc.ravel() - pos[n, 0]) ** 2 + (rows[..., None] + dr.ravel() - pos[n, 1]) ** 2
+        moffat = ((1.0 + d2_sub / psf_Rd[n] ** 2) ** (-psf_n[n])).mean(axis=-1)
+        psf = gaussian_smooth(moffat, k_img) if k_img > 1e-3 else moffat
+        psf = psf / psf.sum()
+        A = np.stack([psf[inside], np.ones(int(inside.sum()))], 1)
+        w = weight[n][inside]
+        try:
+            cov = np.linalg.inv(A.T @ (w[:, None] * A))
+        except np.linalg.LinAlgError:
+            continue
+        beta = cov @ (A.T @ (w * diff[n][inside]))
+        flux[n], err[n] = beta[0], np.sqrt(max(cov[0, 0], 0.0))
+    sn = ~is_template
+    bad = sn & ~(flux > 0)
+    good = sn & (flux > 0)
+    if bad.any():
+        if mjd is not None and good.sum() >= 1:
+            mjd = np.asarray(mjd, dtype=float)
+            order = np.argsort(mjd[good])
+            flux[bad] = np.interp(mjd[bad], mjd[good][order], flux[good][order])
+        else:
+            flux[bad] = np.where(err[bad] > 0, err[bad], 1.0)
+    return flux, err, diff
+
+
 def prepare_initial_scene(data, weight, mask, is_template, crpix, crtan, CD, scene_shape, pix_scale, center, *,
                           scene_scale, softening, prior_scene_factor=1.0, init_image=None, sky=None,
                           threshold_sigma=3.0, fill_sigma=0.0, min_templates=4, subsample=5):
