@@ -1251,6 +1251,7 @@ class Novamac:
             "renoise_step": [],
             "renoise_accept": [],
             "renoise_log_alpha": [],
+            "renoise_parts": [],  # (likelihood change, prior change, proposal-density ratio) per chain
         }  # fmt: skip
         self.trace = trace
 
@@ -1530,17 +1531,19 @@ class Novamac:
             if renoise_fns and s1 % self.renoise_every == 0 and s1 < hold_start and t_chunk > 0:
                 rng, key = jax.random.split(rng)
                 with Timer("renoise", timings, quiet=True):
-                    positions, rn_acc, rn_la, _ = renoise_fns[lik_on](
+                    positions, rn_acc, rn_la, _, rn_parts = renoise_fns[lik_on](
                         jax.random.split(key, C), positions, t_chunk, jj_dev
                     )
                     jax.block_until_ready(positions)
-                rn_acc, rn_la = np.asarray(rn_acc), np.asarray(rn_la)
+                rn_acc, rn_la, rn_parts = np.asarray(rn_acc), np.asarray(rn_la), np.asarray(rn_parts)
                 trace["renoise_step"].append(s1)
                 trace["renoise_accept"].append(rn_acc)
                 trace["renoise_log_alpha"].append(rn_la)
+                trace["renoise_parts"].append(rn_parts)
                 log(
                     f"re-noise proposal at step {s1} (t={t_chunk:.3f}): accepted {np.array2string(rn_acc.astype(int))}, "
-                    f"log alpha {np.array2string(rn_la, precision=1)}"
+                    f"log alpha {np.array2string(rn_la, precision=0)} = likelihood {np.array2string(rn_parts[:, 0], precision=0)} "
+                    f"+ prior {np.array2string(rn_parts[:, 1], precision=0)} + proposal ratio {np.array2string(rn_parts[:, 2], precision=0)}"
                 )
 
             # Diagnostics at the end of the chunk, with the parameters used in it;

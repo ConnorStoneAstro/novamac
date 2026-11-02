@@ -318,8 +318,9 @@ def test_renoise_move_keeps_a_gaussian_target_invariant():
     x, accepted = x0, []
     for _ in range(moves):
         key, k = jax.random.split(key)
-        x, acc, log_alpha, _ = renoise(jax.random.split(k, chains), x, 0.5, jnp.zeros(1))
-        assert bool(jnp.all(jnp.isfinite(log_alpha)))
+        x, acc, log_alpha, _, parts = renoise(jax.random.split(k, chains), x, 0.5, jnp.zeros(1))
+        assert bool(jnp.all(jnp.isfinite(log_alpha))) and parts.shape == (chains, 3)
+        assert np.allclose(np.asarray(parts).sum(axis=1), np.asarray(log_alpha), atol=1e-3)
         accepted.append(float(acc.mean()))
     scene = np.asarray(x[:, :n_scene])
     assert min(accepted) > 0.95, "the Gibbs proposal is (numerically) always accepted"
@@ -329,5 +330,5 @@ def test_renoise_move_keeps_a_gaussian_target_invariant():
     # the bare re-noise (no residual scatter) is a valid but poor proposal
     bare = make_renoise_fn(target, lambda t: 0.0, sigma_fn, scene_mask)
     key, k = jax.random.split(key)
-    _, acc, _, _ = bare(jax.random.split(k, chains), x, 0.5, jnp.zeros(1))
+    _, acc, _, _, _ = bare(jax.random.split(k, chains), x, 0.5, jnp.zeros(1))
     assert float(acc.mean()) < 0.8

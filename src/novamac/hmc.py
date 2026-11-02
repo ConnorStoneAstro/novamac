@@ -628,7 +628,10 @@ def make_renoise_fn(target, broaden_fn, sigma_fn, scene_mask, residual_var_fn=No
     """
     Jitted, chain-vmapped Metropolis move that redraws the scene's noise:
 
-        renoise(keys, x, t, jj) -> (x, accepted, log_alpha, logdensity)
+        renoise(keys, x, t, jj) -> (x, accepted, log_alpha, logdensity, parts)
+
+    parts (chains, 3) splits log_alpha into the likelihood change, the prior
+    change and the proposal-density ratio log q(x|x') - log q(x'|x).
 
     The proposal takes the Tweedie estimate of the clean scene at the
     current state, D(x) = x + sigma_t^2 * score(x), and noises it back up
@@ -675,7 +678,8 @@ def make_renoise_fn(target, broaden_fn, sigma_fn, scene_mask, residual_var_fn=No
         log_alpha = jnp.where(jnp.isfinite(log_alpha), log_alpha, -jnp.inf)
         accept = jnp.log(jax.random.uniform(key_u, dtype=x.dtype)) < log_alpha
         x = jnp.where(accept, x1, x)
-        return x, accept, log_alpha, jnp.where(accept, ll1 + lp1, ll0 + lp0)
+        parts = jnp.stack([ll1 - ll0, lp1 - lp0, log_q_rev - log_q_fwd])
+        return x, accept, log_alpha, jnp.where(accept, ll1 + lp1, ll0 + lp0), parts
 
     return jax.jit(jax.vmap(single, in_axes=(0, 0, None, None)))
 
