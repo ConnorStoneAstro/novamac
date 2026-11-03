@@ -32,6 +32,11 @@ Schedule (see hmc.py for the method)
                                           is idle and the HMC correctors run at a
                                           fixed temperature, time for the chain to
                                           settle before the anneal continues
+                                          (ramp_predictor_only: the ramps between
+                                          plateaus are the predictor alone, the
+                                          prior's reverse diffusion of the scene
+                                          with nothing else moving, and the
+                                          plateaus do all the posterior sampling)
   hold     hold_steps at t = 0            HMC only at the true posterior; the
                                           step sizes adapt for hold_adapt_chunks
                                           more chunks, then every kernel is fixed
@@ -74,6 +79,7 @@ from .hmc import (
     make_block_curvature_fn,
     make_broadening_fn,
     make_chunk_runner,
+    make_predictor_runner,
     make_linear_gibbs_fn,
     make_log_parts,
     make_log_variance_fn,
@@ -106,6 +112,7 @@ from .sampler import (
     flat_data_weight,
     linear_coordinates,
     parameter_blocks,
+    ramp_chunks,
     save_chain_states,
     setup_inverse_mass,
     start_time,
@@ -171,6 +178,14 @@ class Novamac:
     # and the re-noise proposal only rescues the chains while t > 0.5.
     predictor = True
     predictor_noise = 0.0
+    # Anneal ramps as plain prior diffusion: on a chunk where t decreases at
+    # every step only the predictor runs (no corrector, no non-scene step, no
+    # Gibbs refresh, no re-noise, no step size adaptation), so the chain hops
+    # from one noise level to the next under the prior alone and the likelihood
+    # acts only on the plateaus and the hold. Needs plateaus, and the warmup,
+    # every ramp segment and every plateau must be whole chunks
+    # (sampler.ramp_chunks); e.g. 16 plateaus of 256 with anneal_steps 4352.
+    ramp_predictor_only = False
     # Every renoise_every steps (a multiple of chunk_steps) each chain is
     # proposed a fresh noise realisation of its scene: the Tweedie estimate of
     # the clean scene noised back up to sigma_t (plus the denoiser's residual
@@ -1172,6 +1187,11 @@ class Novamac:
             (s, min(s + self.chunk_steps, total)) for s in range(0, total, self.chunk_steps)
         ]
         n_chunks = len(chunk_bounds)
+        # chunks run by the predictor alone (ramp_predictor_only; raises on a chunk
+        # that mixes ramp and fixed-t steps)
+        pred_chunks = ramp_chunks(ts, ts_prev, chunk_bounds) if self.ramp_predictor_only else np.zeros(n_chunks, bool)
+        if self.ramp_predictor_only and not pred_chunks.any():
+            raise ValueError("ramp_predictor_only needs an anneal with ramp chunks (anneal_steps > 0)")
         # from this step on every kernel is fixed (no adaptation, no restarts): the draws
         hold_start = self.warmup_steps + self.anneal_total
         draws_from = (
@@ -1297,10 +1317,14 @@ class Novamac:
             lambda t: inv_mass0 + self.mass_sigma_fraction * float(sigma_fn(t)) ** 2 * scene_mask
         )  # noqa: E731
         runners = {}
-        make_runner = lambda n, on, nuis: make_chunk_runner(  # noqa: E731
-            target if on else target_off, broaden_fn, sigma_fn, self.num_integration_steps, n, self.mass_sigma_fraction,
-            self.predictor_noise, max_abs_scene=self.max_abs_log_scene, predictor=self.predictor,
-            nuisance_log_prior=log_prior_nuisance if nuis else None, nuisance_steps=self.nuisance_integration_steps,
+        make_runner = lambda n, on, nuis, pred: (  # noqa: E731
+            make_predictor_runner(target if on else target_off, broaden_fn, sigma_fn, n, self.predictor_noise, self.max_abs_log_scene)
+            if pred
+            else make_chunk_runner(
+                target if on else target_off, broaden_fn, sigma_fn, self.num_integration_steps, n, self.mass_sigma_fraction,
+                self.predictor_noise, max_abs_scene=self.max_abs_log_scene, predictor=self.predictor,
+                nuisance_log_prior=log_prior_nuisance if nuis else None, nuisance_steps=self.nuisance_integration_steps,
+            )
         )  # fmt: skip
         lik_on = self._likelihood_on(0, t_start)
         nuis_on = False  # the non-scene sub-step exists once a non-scene block has been released
@@ -1347,9 +1371,9 @@ class Novamac:
                     nuis_on = True
 
         with Timer("initial step size search (includes compile)", timings):
-            runners[(1, lik_on, nuis_on)] = make_runner(1, lik_on, nuis_on)
+            runners[(1, lik_on, nuis_on, False)] = make_runner(1, lik_on, nuis_on, False)
             rng, step_size, step_size_nuis = find_initial_step_size(
-                runners[(1, lik_on, nuis_on)],
+                runners[(1, lik_on, nuis_on, False)],
                 rng,
                 positions,
                 inv_mass0,
@@ -1400,6 +1424,11 @@ class Novamac:
                 f"; the anneal pauses for {self.plateau_steps} steps at t="
                 + ", ".join(f"{ts[p]:.3f} (step {p})" for p in plateau_starts)
                 if len(plateau_starts)
+                else ""
+            )
+            + (
+                f"; {int(pred_chunks.sum())} ramp chunks run by the predictor alone (prior diffusion of the scene, eta={self.predictor_noise:g})"
+                if self.ramp_predictor_only
                 else ""
             )
         )
@@ -1511,11 +1540,12 @@ class Novamac:
                 else:
                     log(f"probed {b.name} at step {s0} (t={ts[s0]:.3f}), stays frozen: {summary}")
 
-            if (n, lik_on, nuis_on) not in runners:
-                runners[(n, lik_on, nuis_on)] = make_runner(n, lik_on, nuis_on)
+            pred_only = bool(pred_chunks[ci])  # a predictor-only ramp chunk
+            if (n, lik_on, nuis_on, pred_only) not in runners:
+                runners[(n, lik_on, nuis_on, pred_only)] = make_runner(n, lik_on, nuis_on, pred_only)
             rng, key = jax.random.split(rng)
             with Timer("sampling", timings, quiet=True) as tm:
-                positions, ctrace = runners[(n, lik_on, nuis_on)](
+                positions, ctrace = runners[(n, lik_on, nuis_on, pred_only)](
                     jax.random.split(key, C), positions, as_dev(step_size), as_dev(step_size_nuis), inv_mass0_dev,
                     as_dev(ts[s0:s1]), as_dev(ts_prev[s0:s1]), jj_dev, as_dev(t_release), scene_mask_dev,
                 )  # fmt: skip
@@ -1526,7 +1556,7 @@ class Novamac:
 
             # Exact refresh of the released sky levels and point source fluxes
             gibbs_acc = None
-            if gibbs_fn is not None and lik_on:
+            if gibbs_fn is not None and lik_on and not pred_only:
                 active = (t_chunk <= t_release[lin["idx"]]).astype(np.float64)
                 if active.any():
                     rng, key = jax.random.split(rng)
@@ -1541,7 +1571,7 @@ class Novamac:
                     trace["cond_cov"][ci] = np.asarray(c_cov)
 
             # Re-noise proposal: the Tweedie estimate noised back up to sigma_t
-            if renoise_fns and s1 % self.renoise_every == 0 and s1 < hold_start and t_chunk > 0:
+            if renoise_fns and s1 % self.renoise_every == 0 and s1 < hold_start and t_chunk > 0 and not pred_only:
                 rng, key = jax.random.split(rng)
                 with Timer("renoise", timings, quiet=True):
                     positions, rn_acc, rn_la, _, rn_parts = renoise_fns[lik_on](
@@ -1576,10 +1606,10 @@ class Novamac:
             # Step size adaptation for the next chunk (until the draws start)
             acceptance = np.asarray(ctrace["accept_prob"]).mean(axis=1)
             acceptance_nuis = (
-                np.nanmean(np.asarray(ctrace["accept_prob_nuis"]), axis=1) if nuis_on else None
+                np.nanmean(np.asarray(ctrace["accept_prob_nuis"]), axis=1) if nuis_on and not pred_only else None
             )
             adapting = s1 < draws_from
-            if adapting:
+            if adapting and not pred_only:  # (a predictor-only chunk has no acceptance to adapt on)
                 warming = s1 <= self.warmup_steps or ci < rewarm_until
                 step_size = adapt_step_size(
                     step_size, acceptance, self.target_acceptance, self.acceptance_tol,

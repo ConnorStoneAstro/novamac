@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from novamac.sampler import build_schedule, lagging_chains
+from novamac.sampler import build_schedule, lagging_chains, ramp_chunks
 
 
 def test_schedule_without_plateau():
@@ -75,3 +75,20 @@ def test_accept_copy_is_a_metropolis_test():
     # a finite source always replaces a non-finite chain, never the reverse
     assert accept_copy(-100.0, -np.inf, u=0.999)[0]
     assert not accept_copy(-np.inf, -100.0, u=1e-9)[0]
+
+
+def test_ramp_chunks_classify_whole_chunks_and_reject_mixed_ones():
+    # warmup 8, four ramp segments of 8 around three plateaus of 16, hold 8: every chunk of 8 is pure
+    ts, starts = build_schedule(1.0, 8, 32, 8, plateau_at=[0.75, 0.5, 0.25], plateau_steps=16)
+    ts_prev = np.concatenate([[ts[0]], ts[:-1]])
+    bounds = [(s, s + 8) for s in range(0, len(ts), 8)]
+    ramp = ramp_chunks(ts, ts_prev, bounds)
+    assert len(ramp) == len(bounds) and ramp.sum() == 4
+    assert not ramp[0] and not ramp[-1], "warmup and hold are not ramps"
+    for p0 in starts:
+        assert ramp[(p0 - 8) // 8] and not ramp[p0 // 8] and not ramp[p0 // 8 + 1], "a ramp chunk precedes each plateau"
+    # a plateau that is not a whole number of chunks mixes a chunk
+    ts, _ = build_schedule(1.0, 8, 32, 8, plateau_at=[0.75, 0.5, 0.25], plateau_steps=12)
+    ts_prev = np.concatenate([[ts[0]], ts[:-1]])
+    with pytest.raises(ValueError, match="mixes"):
+        ramp_chunks(ts, ts_prev, [(s, min(s + 8, len(ts))) for s in range(0, len(ts), 8)])

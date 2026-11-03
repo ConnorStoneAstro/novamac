@@ -24,6 +24,7 @@ from novamac.hmc import (
     make_chunk_runner,
     make_gauss_newton_fn,
     make_linear_gibbs_fn,
+    make_predictor_runner,
     make_target,
     release_inverse_mass,
     strided_pixel_groups,
@@ -363,3 +364,36 @@ def test_scalar_jacobian_is_exact_for_an_isotropic_gaussian_prior(toy):
         make_target(toy["log_lik"], log_prior, sigma_fn, mask, True, "scalar")
     with pytest.raises(ValueError):
         make_target(toy["log_lik"], log_prior, sigma_fn, mask, True, "bogus")
+
+
+def test_predictor_runner_is_the_prior_flow_and_leaves_the_rest_alone(toy):
+    """With eta = 0 the predictor-only runner integrates the probability-flow
+    ODE of the toy's Gaussian prior N(pm, ps^2 + sigma_t^2), whose exact flow
+    from sigma_a to sigma_b scales x - pm by sqrt((ps^2 + sigma_b^2) /
+    (ps^2 + sigma_a^2)) on the scene coordinates; the non-scene coordinate
+    must not move, the likelihood never enters the move, and the trace
+    reports pi_t at the returned state with nan acceptance."""
+    scene_mask = jnp.array([1.0, 1.0, 1.0, 1.0, 0.0])
+    pm, ps = toy["prior_mean"], toy["prior_sd"]
+    target = make_target(toy["log_lik"], toy["log_prior"], sigma_fn, scene_mask, tweedie=False)
+    n = 64
+    ts = np.linspace(0.9, 0.3, n + 1)
+    runner = make_predictor_runner(target, broaden_fn, sigma_fn, n, predictor_noise=0.0)
+    C = 3
+    x0 = jnp.asarray(np.tile(pm + 2.0 * ps, (C, 1)) + np.arange(C)[:, None] * 0.1, jnp.float32)
+    jj = jnp.asarray(np.sum(toy["A"] ** 2, axis=1), jnp.float32)
+    dev = lambda a: jnp.asarray(a, jnp.float32)  # noqa: E731
+    x, tr = runner(jax.random.split(jax.random.key(5), C), x0, jnp.full(C, 0.1), jnp.full(C, 0.1), jnp.ones(D), dev(ts[1:]), dev(ts[:-1]), jj,
+                   jnp.full(D, jnp.inf), scene_mask)  # fmt: skip
+    sa, sb = float(sigma_fn(ts[0])), float(sigma_fn(ts[-1]))
+    scale = np.sqrt((ps**2 + sb**2) / (ps**2 + sa**2))
+    expected = pm + (np.asarray(x0) - pm) * scale
+    x = np.asarray(x)
+    assert np.allclose(x[:, :4], expected[:, :4], rtol=2e-2, atol=1e-3), "scene coordinates do not follow the prior flow"
+    assert np.array_equal(x[:, 4], np.asarray(x0)[:, 4]), "the non-scene coordinate moved"
+    assert set(tr) == {"logdensity", "loglik", "logprior", "accept_prob", "log_alpha", "divergent", "predictor_rms",
+                       "accept_prob_nuis", "log_alpha_nuis", "divergent_nuis"}  # fmt: skip
+    assert np.all(np.isnan(np.asarray(tr["accept_prob"]))) and np.all(np.asarray(tr["predictor_rms"]) > 0)
+    ev = broaden_fn(ts[-1]) * jj
+    lp_true = np.array([float(toy["log_lik"](x[c], ev) + toy["log_prior"](x[c], ts[-1])) for c in range(C)])
+    assert np.allclose(np.asarray(tr["logdensity"])[:, -1], lp_true, rtol=1e-4, atol=1e-3)

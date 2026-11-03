@@ -126,3 +126,28 @@ def test_plateau_run(tmp_path, prior_dir, synthetic):
         assert trace["block_release_step"][names.index("sky")] < 0, "the frozen sky block is never released"
     nm.plot_progress()
     assert nm.files.figure("sample_progress").exists()
+
+
+def test_predictor_only_ramp_run(tmp_path, prior_dir, synthetic):
+    """ramp_predictor_only: the chunks where t decreases are the prior's
+    reverse diffusion alone (scene displaced, no acceptance, no Gibbs refresh,
+    no re-noise proposal), the plateaus, warmup and hold sample as usual."""
+    inputs, _ = synthetic
+    s = dict(FAST_SETTINGS, plateau_steps=16, plateau_at=[0.75, 0.5, 0.25], ramp_predictor_only=True, frozen_blocks=("sky",))
+    nm = Novamac(prior=prior_dir, out_dir=tmp_path / "out", name="syn_g_ramps", **s, **inputs)
+    trace = nm.sample()
+    total = s["warmup_steps"] + s["anneal_steps"] + 3 * s["plateau_steps"] + s["hold_steps"]
+    assert int(trace["steps_done"]) == total and np.all(np.isfinite(trace["logdensity"]))
+    t = np.asarray(trace["t"])
+    ramp = np.concatenate([[False], t[1:] < t[:-1]])
+    assert ramp.sum() == s["anneal_steps"]
+    acc, prms = np.asarray(trace["accept_prob"]), np.asarray(trace["predictor_rms"])
+    assert np.all(np.isnan(acc[ramp])) and np.all(prms[ramp] > 0), "ramp steps are predictor-only"
+    assert np.all(np.isfinite(acc[~ramp])) and np.allclose(prms[~ramp], 0.0, atol=1e-5), "fixed-t steps are HMC without predictor"
+    n = s["chunk_steps"]
+    ramp_chunk_ends = {int(e) for e in np.arange(n, total + 1, n) if ramp[e - 1]}
+    assert not ramp_chunk_ends & {int(e) for e in trace["renoise_step"]}, "no re-noise proposal on a ramp chunk"
+    if "gibbs_accept" in trace:
+        g = np.asarray(trace["gibbs_accept"], dtype=float)
+        for e in ramp_chunk_ends:
+            assert np.all(np.isnan(g[e // n - 1])), "no Gibbs refresh on a ramp chunk"

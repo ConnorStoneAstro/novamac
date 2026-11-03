@@ -21,10 +21,13 @@ exp(sigma_t^2 / 2) is ignored; it vanishes as t -> 0.
 
 Each step from t_prev to t is a predictor-corrector pair:
   * predictor: one Heun step of the reverse VE diffusion of the scene from
-    sigma(t_prev) to sigma(t) driven by the posterior score (prior + broadened
-    likelihood), with a tunable noise fraction (0 = probability-flow ODE,
-    1 = reverse SDE). Only the diffused coordinates (the scene) move.
+    sigma(t_prev) to sigma(t) driven by the PRIOR score alone, with a tunable
+    noise fraction (0 = probability-flow ODE, 1 = reverse SDE). Only the
+    diffused coordinates (the scene) move. The likelihood enters through the
+    corrector only (see make_chunk_runner for why).
   * corrector: one exact Metropolis-corrected HMC transition for pi_t.
+A predictor-only runner (make_predictor_runner) does the first half alone, for
+anneal segments run as plain prior diffusion between two noise levels.
 Only the final state is meant to be a sample of the t = 0 posterior.
 
 Mechanics
@@ -437,6 +440,68 @@ def fold_into_box(x, bound, scene_mask):
     return jnp.where(in_box, folded, x), flip
 
 
+# Predictor step and predictor-only chunk
+#####################################################################
+def make_predictor_step(prior_grad, sigma_fn, predictor_noise, bound):
+    """predictor_step(key, x, t_prev, t, scene_mask) -> (x_new, rms displacement
+    over the scene): one Heun step of the prior's reverse VE diffusion of the
+    scene coordinates from sigma(t_prev) to sigma(t),
+        dx = -(1 + eta)/2 * d(sigma^2) * score + sqrt(eta * |d(sigma^2)|) * z,
+    eta = predictor_noise (1: reverse SDE, 0: probability-flow ODE), reflected
+    into |x| <= bound; a no-op when sigma(t) >= sigma(t_prev) and when the
+    step is non-finite."""
+
+    def predictor_step(key, x, t_prev, t, scene_mask):
+        n_scene = jnp.maximum(jnp.sum(scene_mask), 1.0)
+        s_cur, s_new = sigma_fn(t_prev), sigma_fn(t)
+        dvar = jnp.maximum(s_cur**2 - s_new**2, 0.0)  # decrease of the noise variance
+        drift_coef = 0.5 * (1.0 + predictor_noise) * dvar
+        noise = jnp.sqrt(predictor_noise * dvar) * jax.random.normal(key, x.shape, x.dtype) * scene_mask
+        g_cur = prior_grad(x, t_prev)
+        x_euler, _ = fold_into_box(x + drift_coef * g_cur * scene_mask + noise, bound, scene_mask)
+        g_new = prior_grad(x_euler, t)
+        x_new, _ = fold_into_box(x + 0.5 * drift_coef * (g_cur + g_new) * scene_mask + noise, bound, scene_mask)
+        # a non-finite predictor step is dropped rather than propagated
+        ok = jnp.all(jnp.isfinite(x_new))
+        x_new = jnp.where(ok, x_new, x)
+        return x_new, jnp.sqrt(jnp.sum(((x_new - x) * scene_mask) ** 2) / n_scene)
+
+    return predictor_step
+
+
+def make_predictor_runner(target, broaden_fn, sigma_fn, chunk_steps, predictor_noise=1.0, max_abs_scene=jnp.inf):
+    """
+    The predictor half of make_chunk_runner on its own: `chunk_steps` Heun
+    steps of the prior's reverse diffusion of the scene, no corrector, no
+    non-scene move. Same call signature and trace keys as the chunk runner
+    (the step sizes, inverse mass and t_release are accepted and ignored),
+    so the host loop can swap it in for a chunk. The logged density is pi_t
+    at the state each step ends on (one target evaluation per step, for the
+    trace and the lagging-chain check); accept_prob, log_alpha and the
+    *_nuis keys are nan / False.
+    """
+    predictor_step = make_predictor_step(target.prior_grad, sigma_fn, predictor_noise, jnp.asarray(max_abs_scene))
+
+    def single_chain(key, x, step_size, step_size_nuis, inv_mass0, ts, ts_prev, jj, t_release, scene_mask):
+        def step(x, inputs):
+            key, t, t_prev = inputs
+            x, pred_rms = predictor_step(key, x, t_prev, t, scene_mask)
+            (lp, (ll, lpr, _)), _ = target.value_and_grad(x, t, broaden_fn(t) * jj)
+            nan = jnp.asarray(jnp.nan, x.dtype)
+            return x, (lp, ll, lpr, nan, nan, False, pred_rms, nan, nan, False)
+
+        keys = jax.random.split(key, chunk_steps)
+        x, (lp, ll, lpr, acc, la, div, prms, acc_n, la_n, div_n) = jax.lax.scan(step, x, (keys, ts, ts_prev))
+        trace = {
+            "logdensity": lp, "loglik": ll, "logprior": lpr,
+            "accept_prob": acc, "log_alpha": la, "divergent": div, "predictor_rms": prms,
+            "accept_prob_nuis": acc_n, "log_alpha_nuis": la_n, "divergent_nuis": div_n,
+        }  # fmt: skip
+        return x, trace
+
+    return jax.jit(jax.vmap(single_chain, in_axes=(0, 0, 0, 0, None, None, None, None, None, None)))
+
+
 # Predictor-corrector chunk
 #####################################################################
 def make_chunk_runner(
@@ -519,10 +584,9 @@ def make_chunk_runner(
         val = jnp.where(inside, val, -jnp.inf)
         return (val, aux), g
 
-    prior_grad = target.prior_grad  # the predictor follows the prior score only
+    predictor_step = make_predictor_step(target.prior_grad, sigma_fn, predictor_noise, bound)
 
     def single_chain(key, x, step_size, step_size_nuis, inv_mass0, ts, ts_prev, jj, t_release, scene_mask):
-        n_scene = jnp.maximum(jnp.sum(scene_mask), 1.0)
         value_and_grad = lambda x, t, ev: _value_and_grad(x, t, ev, scene_mask)  # noqa: E731
         if nuisance_log_prior is not None:
             # the non-scene sub-step's target: likelihood at the (fixed) denoised
@@ -537,20 +601,6 @@ def make_chunk_runner(
             # scene coordinates folded back into the box (no-op when bound = inf);
             # also returns which coordinates need their momentum flipped
             return fold_into_box(x, bound, scene_mask)
-
-        def predictor_step(key, x, t_prev, t):
-            s_cur, s_new = sigma_fn(t_prev), sigma_fn(t)
-            dvar = jnp.maximum(s_cur**2 - s_new**2, 0.0)  # decrease of the noise variance
-            drift_coef = 0.5 * (1.0 + predictor_noise) * dvar
-            noise = jnp.sqrt(predictor_noise * dvar) * jax.random.normal(key, x.shape, x.dtype) * scene_mask
-            g_cur = prior_grad(x, t_prev)
-            x_euler, _ = reflect_scene(x + drift_coef * g_cur * scene_mask + noise)
-            g_new = prior_grad(x_euler, t)
-            x_new, _ = reflect_scene(x + 0.5 * drift_coef * (g_cur + g_new) * scene_mask + noise)
-            # a non-finite predictor step is dropped rather than propagated
-            ok = jnp.all(jnp.isfinite(x_new))
-            x_new = jnp.where(ok, x_new, x)
-            return x_new, jnp.sqrt(jnp.sum(((x_new - x) * scene_mask) ** 2) / n_scene)
 
         def corrector(key, x, t, extra_var, inv_mass, active, step_size, n_leap, vg):
             """One HMC transition on the coordinates in `active` with step size
@@ -605,7 +655,7 @@ def make_chunk_runner(
             key, t, t_prev = inputs
             key_pred, key_corr, key_nuis = jax.random.split(key, 3)
             if predictor:
-                x, pred_rms = predictor_step(key_pred, x, t_prev, t)
+                x, pred_rms = predictor_step(key_pred, x, t_prev, t, scene_mask)
             else:
                 pred_rms = jnp.zeros((), x.dtype)  # corrector only: HMC tracks the moving target by itself
             extra_var = broaden_fn(t) * jj

@@ -54,6 +54,26 @@ def build_schedule(t_start, warmup_steps, anneal_steps, hold_steps, plateau_at=N
     return np.concatenate([np.full(warmup_steps, t_start), anneal, np.zeros(hold_steps)]), np.asarray(starts, dtype=int)
 
 
+def ramp_chunks(ts, ts_prev, chunk_bounds):
+    """Per chunk, whether every step of it lowers t (a ramp chunk) as opposed
+    to none of them (warmup, plateau, hold). A chunk that mixes the two is an
+    error: the predictor-only ramps (Novamac.ramp_predictor_only) run a whole
+    chunk one way or the other, so the warmup, every ramp segment and every
+    plateau must be whole chunks (multiples of chunk_steps)."""
+    ramp = np.asarray(ts) < np.asarray(ts_prev)
+    out = []
+    for s0, s1 in chunk_bounds:
+        r = ramp[s0:s1]
+        if r.any() and not r.all():
+            raise ValueError(
+                f"chunk {s0}-{s1} mixes anneal ramp and fixed-t steps; with ramp_predictor_only the warmup, "
+                "every ramp segment and every plateau must be whole chunks (e.g. plateau_steps and "
+                "anneal_steps / (number of plateaus + 1) multiples of chunk_steps)"
+            )
+        out.append(bool(r.all()))
+    return np.asarray(out)
+
+
 # Parameter blocks
 #####################################################################
 class Block:
