@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 from ._backend import DTYPE  # noqa: E402
-from .hmc import SCORE_FIELDS, block_indices, make_log_parts, make_sigma_fn  # noqa: E402
+from .hmc import SCORE_FIELDS, block_indices, make_log_parts, make_sigma_fn, sampler_sde  # noqa: E402
 from .products import (  # noqa: E402
     collect_fluxes,
     draw_states,
@@ -465,7 +465,7 @@ def plot_tweedie(nm, trace=None, max_panels=16):
             _, group1 = model.get_values()
         _, log_prior, _ = make_log_parts(model, jnp.asarray(group1, DTYPE))
         score_fn = jax.jit(jax.grad(log_prior))
-        sigma_fn = make_sigma_fn(model.meta.host_prior.sde)
+        sigma_fn = make_sigma_fn(sampler_sde(model))
         pix = model.models.pixelated_batch_model.model
         scene_idx = jnp.asarray(block_indices(model, [pix.I]))
         images = np.full((n_chains, int(max(pick)) + 1) + tuple(pix.I.shape), np.nan)

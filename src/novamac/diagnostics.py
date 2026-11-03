@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._backend import DTYPE, MATMUL_PRECISION
-from .hmc import make_broadening_fn, make_chunk_runner, make_log_parts, make_log_variance_fn, make_sigma_fn, make_target
+from .hmc import make_broadening_fn, make_chunk_runner, make_log_parts, make_log_variance_fn, make_sigma_fn, make_target, sampler_sde
 from .products import load_chain_state, num_saved_states, read_scene_history
 from .sampler import calibrate_prior_offset, parameter_blocks
 from .utils import log
@@ -108,7 +108,7 @@ def diagnose_stall(nm, n_last=4):
     model = nm.build_model()
     blocks = {b.name: b.idx for b in parameter_blocks(model, nm.release_t, nm.release_latest_t)}
     blocks["scene"] = trace["scene_idx"]
-    sde = model.meta.host_prior.sde
+    sde = sampler_sde(model)
     data_std = nm.prior.config["sde"].get("data_std")
     tweedie = bool(trace["tweedie"])
     sigma_fn, broaden_fn = make_sigma_fn(sde), make_broadening_fn(sde, float(data_std) if tweedie else None)

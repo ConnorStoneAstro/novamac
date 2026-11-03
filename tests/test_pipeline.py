@@ -8,11 +8,13 @@ couple of minutes on a CPU (jit compiles dominate); the prior-only and
 frozen test modes are marked slow.
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from conftest import FAST_SETTINGS
 from novamac import Novamac
+from novamac._backend import DTYPE
 from novamac.products import RunFiles, collect_fluxes
 
 FIGURES = (
@@ -126,6 +128,62 @@ def test_plateau_run(tmp_path, prior_dir, synthetic):
         assert trace["block_release_step"][names.index("sky")] < 0, "the frozen sky block is never released"
     nm.plot_progress()
     assert nm.files.figure("sample_progress").exists()
+
+
+def test_prior_t_min_remaps_the_prior_time(tmp_path, prior_dir, synthetic):
+    """prior_t_min: the model's log prior at t is the plain model's at
+    t_a = prior_t_min + (1 - prior_t_min) t, and the sampler's schedule
+    (model.meta.prior_sde) has sigma_min = sigma(prior_t_min)."""
+    import caskade as ck
+    from novamac.hmc import make_log_parts, sampler_sde
+
+    inputs, _ = synthetic
+    models = {}
+    for t_min in (0.0, 0.1):
+        nm = Novamac(prior=prior_dir, out_dir=tmp_path / f"out{t_min}", name="syn_g", **FAST_SETTINGS, prior_t_min=t_min, **inputs)
+        models[t_min] = nm.build_model()
+    plain, floor = models[0.0], models[0.1]
+    host = plain.meta.host_prior.sde
+    assert sampler_sde(plain).sigma_min == pytest.approx(host.sigma_min)
+    assert sampler_sde(floor).sigma_min == pytest.approx(float(host.sigma(0.1)))
+    assert sampler_sde(floor).sigma_max == pytest.approx(host.sigma_max)
+    for t in (0.0, 0.5, 1.0):
+        assert float(sampler_sde(floor).sigma(t)) == pytest.approx(float(host.sigma(0.1 + 0.9 * t)), rel=1e-6)
+    with ck.ValidContext(plain):
+        x0, group1 = plain.get_values()
+    x, group1 = jnp.asarray(x0, DTYPE), jnp.asarray(group1, DTYPE)
+    _, lp_plain, _ = make_log_parts(plain, group1)
+    _, lp_floor, _ = make_log_parts(floor, group1)
+    for t in (0.0, 0.5, 1.0):
+        assert float(lp_floor(x, t)) == pytest.approx(float(lp_plain(x, 0.1 + 0.9 * t)), rel=1e-5)
+    with pytest.raises(ValueError, match="prior_t_min"):
+        Novamac(prior=prior_dir, out_dir=tmp_path / "bad", name="syn_g", **FAST_SETTINGS, prior_t_min=1.0, **inputs).build_model()
+
+
+def test_predictor_only_ramps_below_a_t_threshold(tmp_path, prior_dir, synthetic):
+    """ramp_predictor_below: only the ramps starting at or below it are
+    predictor-only, the ones above keep the corrector; with prior_t_min set."""
+    inputs, _ = synthetic
+    s = dict(
+        FAST_SETTINGS, plateau_steps=16, plateau_at=[0.75, 0.5, 0.25], ramp_predictor_only=True,
+        ramp_predictor_below=0.6, prior_t_min=0.1, frozen_blocks=("sky",),
+    )  # fmt: skip
+    nm = Novamac(prior=prior_dir, out_dir=tmp_path / "out", name="syn_g_ramps_low", **s, **inputs)
+    trace = nm.sample()
+    assert np.all(np.isfinite(trace["logdensity"])) and float(trace["prior_t_min"]) == 0.1
+    t = np.asarray(trace["t"])
+    t_prev = np.concatenate([[t[0]], t[:-1]])
+    n = s["chunk_steps"]
+    # a chunk is predictor-only when it ramps and starts at or below 0.6 (the
+    # plateau t it ramps down from; a ramp that merely passes 0.6 is not), so
+    # the first ramp (from t_start, above 0.6) keeps the corrector
+    starts = np.array([t_prev[c] for c in range(0, len(t), n) if t[c] < t_prev[c]])
+    assert starts.max() > 0.6 and 0 < np.sum(starts <= 0.6) < len(starts)
+    pred = np.concatenate([np.repeat((t[c] < t_prev[c]) & (t_prev[c] <= 0.6), n) for c in range(0, len(t), n)])
+    assert pred.sum() == n * np.sum(starts <= 0.6)
+    acc = np.asarray(trace["accept_prob"])
+    assert np.all(np.isnan(acc[pred])) and np.all(np.isfinite(acc[~pred]))
+    assert int(np.sum(trace["predictor_chunks"])) == int(np.sum(starts <= 0.6))
 
 
 def test_predictor_only_ramp_run(tmp_path, prior_dir, synthetic):

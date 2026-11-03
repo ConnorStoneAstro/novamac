@@ -130,6 +130,13 @@ def block_indices(model, params, element=None, group=0):
     )  # fmt: skip
 
 
+def sampler_sde(model):
+    """The VE schedule the sampler runs on: model.meta.prior_sde (build_prior;
+    the prior's own schedule unless prior_t_min raised its sigma_min), falling
+    back to the prior's for a model built without it."""
+    return getattr(model.meta, "prior_sde", model.meta.host_prior.sde)
+
+
 def make_sigma_fn(sde):
     """sigma(t) of the prior's VE schedule as a pure jnp function."""
     sigma_min, sigma_max = float(sde.sigma_min), float(sde.sigma_max)

@@ -4,7 +4,7 @@ import types
 import astrophot as ap
 import jax.numpy as jnp
 
-from .host_prior import Prior, load_prior
+from .host_prior import Prior, VESDE, load_prior
 
 
 def build_prior(
@@ -19,6 +19,7 @@ def build_prior(
     psf_PA_prior_width: float = 0.2,
     scene_scale_prior_width: float = 3.0,
     prior_scene_factor: float = 1.0,
+    prior_t_min: float = 0.0,
 ):
     """
     Taking a model generated with `build_likelihood_model` this will construct a
@@ -32,6 +33,11 @@ def build_prior(
         i.e. it is shown a scene this many times brighter than the one the likelihood
         renders (an experiment: brighter training objects come with flatter, simpler
         surroundings). 1 means the prior sees the scene as it is (float)
+      - prior_t_min: the diffusion time the host prior is shown is t_a = prior_t_min +
+        (1 - prior_t_min) * t, i.e. the sampler uses the prior as if it had been trained
+        with sigma_min = sigma(prior_t_min): model.meta.prior_sde is that schedule, and
+        everything that reads a sigma from t (log_prior, the sampler's broadening, mass,
+        offset table) reads it from there. 0 means the prior's own schedule (float)
       - wcs_prior_width: The width of the Gaussian prior on the WCS parameters
         in tangent plane coordinates, in arcseconds (float)
       - ps_position_prior_width: The width of the Gaussian prior on the PS positions
@@ -56,6 +62,12 @@ def build_prior(
     # a sampler that needs the sigma(t) schedule or wants to seed a mass
     # matrix from the prior widths.
     model.meta.host_prior = host_prior
+    if not 0.0 <= float(prior_t_min) < 1.0:
+        raise ValueError(f"prior_t_min must be in [0, 1), got {prior_t_min}")
+    sde = host_prior.sde
+    model.meta.prior_t_min = float(prior_t_min)
+    model.meta.prior_sde = VESDE(float(sde.sigma(float(prior_t_min))), float(sde.sigma_max), float(sde.data_mean))
+    prior_sde = model.meta.prior_sde
     model.meta.prior_scene_factor = float(prior_scene_factor)
     log_prior_scene_factor = float(jnp.log(prior_scene_factor))
     model.meta.prior_widths = {
@@ -129,8 +141,10 @@ def build_prior(
         """
         Unnormalized log prior. `t` in [0, 1] is the diffusion time of the
         host-galaxy prior: the pixel prior is evaluated at noise level
-        sigma(t) of the VE schedule, so t=1 is the broadest (nearly Gaussian)
-        prior and t=0 the sharpest one the model was trained on. The Gaussian
+        sigma(t) of the sampler's VE schedule (model.meta.prior_sde), so t=1
+        is the broadest (nearly Gaussian) prior and t=0 the sharpest one the
+        sampler uses: the one the model was trained on, or sigma(prior_t_min)
+        of the model's own schedule when prior_t_min > 0. The Gaussian
         priors on the other parameters do not depend on t.
 
         If `self.meta.prior_energy_offset` is set to a function of sigma, its
@@ -144,7 +158,7 @@ def build_prior(
         # Prior on pixel fluxes (in the prior's own units: the scene scale absorbs the rest)
         # the prior sees the scene prior_scene_factor times brighter than the likelihood does
         log_pix = jnp.log(self.models.pixelated_batch_model.model.I.value) + log_prior_scene_factor
-        sigma = host_prior.sde.sigma(t)
+        sigma = prior_sde.sigma(t)  # the sampler's schedule (sigma_min raised by prior_t_min)
         offset_fn = getattr(self.meta, "prior_energy_offset", None)
         pixel_offset = offset_fn(sigma) if offset_fn is not None else 0.0
         lp = lp + host_prior.log_prob(log_pix, sigma, pixel_offset)

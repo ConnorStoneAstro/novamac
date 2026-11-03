@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._backend import DTYPE
-from .hmc import block_indices, flat_index, make_gauss_newton_fn, strided_pixel_groups
+from .hmc import block_indices, flat_index, make_gauss_newton_fn, sampler_sde, strided_pixel_groups
 from .utils import log
 
 
@@ -54,13 +54,16 @@ def build_schedule(t_start, warmup_steps, anneal_steps, hold_steps, plateau_at=N
     return np.concatenate([np.full(warmup_steps, t_start), anneal, np.zeros(hold_steps)]), np.asarray(starts, dtype=int)
 
 
-def ramp_chunks(ts, ts_prev, chunk_bounds):
+def ramp_chunks(ts, ts_prev, chunk_bounds, below_t=np.inf):
     """Per chunk, whether every step of it lowers t (a ramp chunk) as opposed
-    to none of them (warmup, plateau, hold). A chunk that mixes the two is an
-    error: the predictor-only ramps (Novamac.ramp_predictor_only) run a whole
-    chunk one way or the other, so the warmup, every ramp segment and every
-    plateau must be whole chunks (multiples of chunk_steps)."""
-    ramp = np.asarray(ts) < np.asarray(ts_prev)
+    to none of them (warmup, plateau, hold), and the chunk starts at or below
+    `below_t` (the t it ramps down from; inf = every ramp chunk). A chunk that
+    mixes ramp and fixed-t steps is an error: the predictor-only ramps
+    (Novamac.ramp_predictor_only) run a whole chunk one way or the other, so
+    the warmup, every ramp segment and every plateau must be whole chunks
+    (multiples of chunk_steps)."""
+    ts, ts_prev = np.asarray(ts), np.asarray(ts_prev)
+    ramp = ts < ts_prev
     out = []
     for s0, s1 in chunk_bounds:
         r = ramp[s0:s1]
@@ -70,7 +73,7 @@ def ramp_chunks(ts, ts_prev, chunk_bounds):
                 "every ramp segment and every plateau must be whole chunks (e.g. plateau_steps and "
                 "anneal_steps / (number of plateaus + 1) multiples of chunk_steps)"
             )
-        out.append(bool(r.all()))
+        out.append(bool(r.all()) and float(ts_prev[s0:s1].max()) <= below_t)
     return np.asarray(out)
 
 
@@ -170,7 +173,7 @@ def calibrate_prior_offset(model, scene_log, rng_key, n_sigmas=64):
     (sigmas, values).
     """
     prior = model.meta.host_prior
-    sde = prior.sde
+    sde = sampler_sde(model)
     sigmas = np.exp(np.linspace(np.log(sde.sigma_min), np.log(sde.sigma_max), n_sigmas))
     # in the prior's coordinate: the prior is shown the scene prior_scene_factor times brighter
     scene = jnp.asarray(scene_log, DTYPE) + float(np.log(getattr(model.meta, "prior_scene_factor", 1.0)))
@@ -265,7 +268,7 @@ def prior_precision(model, weight, mask):
     release criterion.
     """
     widths = model.meta.prior_widths
-    sigma_min = float(model.meta.host_prior.sde.sigma_min)
+    sigma_min = float(sampler_sde(model).sigma_min)
     pix = model.models.pixelated_batch_model.model
     psf, sky = pix.psf, model.models.sky_batch_model.model
     is_template = np.asarray(model.meta.is_template, dtype=bool)

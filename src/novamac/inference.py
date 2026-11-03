@@ -36,7 +36,9 @@ Schedule (see hmc.py for the method)
                                           plateaus are the predictor alone, the
                                           prior's reverse diffusion of the scene
                                           with nothing else moving, and the
-                                          plateaus do all the posterior sampling)
+                                          plateaus do all the posterior sampling;
+                                          ramp_predictor_below limits that to the
+                                          ramps starting at or below that t)
   hold     hold_steps at t = 0            HMC only at the true posterior; the
                                           step sizes adapt for hold_adapt_chunks
                                           more chunks, then every kernel is fixed
@@ -84,6 +86,7 @@ from .hmc import (
     make_log_parts,
     make_log_variance_fn,
     make_nuisance_log_prior,
+    sampler_sde,
     make_renoise_fn,
     make_score_fn,
     make_sigma_fn,
@@ -186,6 +189,11 @@ class Novamac:
     # every ramp segment and every plateau must be whole chunks
     # (sampler.ramp_chunks); e.g. 16 plateaus of 256 with anneal_steps 4352.
     ramp_predictor_only = False
+    # ... and only on the ramps that start at t <= ramp_predictor_below (the
+    # plateau t they ramp down from); the ramps above keep the corrector. At
+    # large sigma an eta = 1 predictor hop throws a bright-host scene far from
+    # the data and a short plateau does not recover it. 1 = every ramp.
+    ramp_predictor_below = 1.0
     # Every renoise_every steps (a multiple of chunk_steps) each chain is
     # proposed a fresh noise realisation of its scene: the Tweedie estimate of
     # the clean scene noised back up to sigma_t (plus the denoiser's residual
@@ -419,6 +427,15 @@ class Novamac:
     # the Gaussian prior widths of the non-scene parameters; "wcs" None means
     # one data pixel.
     prior_scene_factor = 1.0
+    # prior_t_min: the diffusion time the host prior is shown is
+    # t_a = prior_t_min + (1 - prior_t_min) * t, i.e. the prior is used as if
+    # trained with sigma_min = sigma(prior_t_min) (build_prior sets
+    # model.meta.prior_sde, and the sampler's sigma(t), broadening, Tweedie
+    # shift, mass and offset table all follow that schedule). The anneal and
+    # the plain-likelihood hold still end at t = 0: it is a posterior under a
+    # prior with a slightly larger sigma_min, for a model that is not well
+    # trained at its own. 0 = the prior's own sigma_min.
+    prior_t_min = 0.0
     prior_widths = {
         "wcs": None,  # arcsec; None = one data pixel
         "ps_position": 0.2,  # arcsec; a data pixel: the input position is at least that good
@@ -761,7 +778,7 @@ class Novamac:
         if widths.get("wcs") is None:
             widths["wcs"] = self.data_pixel_scale
         self.model = build_prior(
-            model, self.prior, prior_scene_factor=self.prior_scene_factor,
+            model, self.prior, prior_scene_factor=self.prior_scene_factor, prior_t_min=self.prior_t_min,
             **{f"{k}_prior_width": v for k, v in widths.items()},
         )  # fmt: skip
         return self.model
@@ -957,7 +974,7 @@ class Novamac:
                 )
             )
             log_lik = jax.jit(lambda x, extra_var: jnp.zeros((), dtype=x.dtype))
-        sde = model.meta.host_prior.sde
+        sde = sampler_sde(model)  # sigma_min raised to sigma(prior_t_min) when that is set
         sigma_fn = make_sigma_fn(sde)
         tweedie = self.tweedie and not no_likelihood
         data_std = self.prior.config["sde"].get("data_std")
@@ -975,6 +992,12 @@ class Novamac:
         t_start = 1.0 if from_noise else start_time(sde, self.sigma_start)
         log(
             f"schedule starts at t={t_start:.3f} (sigma={float(sigma_fn(t_start)):.3g}; sigma range [{sde.sigma_min:.3g}, {sde.sigma_max:.3g}])"
+            + (
+                f"; the prior is shown t_a = {self.prior_t_min:g} + {1 - self.prior_t_min:g} t (prior_t_min): its own sigma_min "
+                f"{float(model.meta.host_prior.sde.sigma_min):.3g} is never reached"
+                if self.prior_t_min > 0
+                else ""
+            )
         )
 
         pix = model.models.pixelated_batch_model.model
@@ -1189,9 +1212,15 @@ class Novamac:
         n_chunks = len(chunk_bounds)
         # chunks run by the predictor alone (ramp_predictor_only; raises on a chunk
         # that mixes ramp and fixed-t steps)
-        pred_chunks = ramp_chunks(ts, ts_prev, chunk_bounds) if self.ramp_predictor_only else np.zeros(n_chunks, bool)
+        pred_chunks = (
+            ramp_chunks(ts, ts_prev, chunk_bounds, float(self.ramp_predictor_below))
+            if self.ramp_predictor_only
+            else np.zeros(n_chunks, bool)
+        )
         if self.ramp_predictor_only and not pred_chunks.any():
-            raise ValueError("ramp_predictor_only needs an anneal with ramp chunks (anneal_steps > 0)")
+            raise ValueError(
+                "ramp_predictor_only needs an anneal with ramp chunks (anneal_steps > 0) starting at t <= ramp_predictor_below"
+            )
         # from this step on every kernel is fixed (no adaptation, no restarts): the draws
         hold_start = self.warmup_steps + self.anneal_total
         draws_from = (
@@ -1215,6 +1244,8 @@ class Novamac:
             "mass_sigma_fraction": self.mass_sigma_fraction,
             "predictor_noise": self.predictor_noise,
             "predictor": self.predictor,
+            "predictor_chunks": pred_chunks,  # chunks run by the predictor alone (ramp_predictor_only)
+            "prior_t_min": self.prior_t_min,
             "tweedie": tweedie,
             **({"prior_offset_sigma": prior_offset_table[0], "prior_offset_value": prior_offset_table[1]} if prior_offset_table is not None else {}),
             "mean_correction": log_var_fn is not None,
@@ -1427,7 +1458,8 @@ class Novamac:
                 else ""
             )
             + (
-                f"; {int(pred_chunks.sum())} ramp chunks run by the predictor alone (prior diffusion of the scene, eta={self.predictor_noise:g})"
+                f"; {int(pred_chunks.sum())} ramp chunks run by the predictor alone (prior diffusion of the scene, eta={self.predictor_noise:g}"
+                + (f"; ramps starting above t={self.ramp_predictor_below:g} keep the corrector)" if self.ramp_predictor_below < t_start else ")")
                 if self.ramp_predictor_only
                 else ""
             )

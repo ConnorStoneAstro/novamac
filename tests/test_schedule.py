@@ -87,6 +87,12 @@ def test_ramp_chunks_classify_whole_chunks_and_reject_mixed_ones():
     assert not ramp[0] and not ramp[-1], "warmup and hold are not ramps"
     for p0 in starts:
         assert ramp[(p0 - 8) // 8] and not ramp[p0 // 8] and not ramp[p0 // 8 + 1], "a ramp chunk precedes each plateau"
+    # below_t keeps only the ramps that start (the t they ramp down from) at or below it:
+    # the ramps from 0.5 and from 0.25, not those from 1.0 and 0.75
+    low = ramp_chunks(ts, ts_prev, bounds, below_t=0.6)
+    assert low.sum() == 2 and np.all(low <= ramp)
+    assert all(ts_prev[s0] <= 0.6 for (s0, _), r in zip(bounds, low) if r)
+    assert all(ts_prev[s0] > 0.6 for (s0, _), r, r0 in zip(bounds, low, ramp) if r0 and not r)
     # a plateau that is not a whole number of chunks mixes a chunk
     ts, _ = build_schedule(1.0, 8, 32, 8, plateau_at=[0.75, 0.5, 0.25], plateau_steps=12)
     ts_prev = np.concatenate([[ts[0]], ts[:-1]])
