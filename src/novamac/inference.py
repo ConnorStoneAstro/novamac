@@ -166,9 +166,10 @@ class Novamac:
     # Predictor on/off (corrector-only annealing when False: HMC alone tracks the
     # moving target), and its noise: fraction of the reverse-SDE noise (1 =
     # reverse SDE, 0 = probability-flow ODE); the drift is scaled accordingly.
-    # Off: the anneal moves slowly enough per step for HMC to follow, and the
-    # unadjusted predictor step was suspected of pushing the scene the wrong way.
-    predictor = False
+    # Keep it on: without it the corrector cannot follow sigma_t down the anneal
+    # (log density -1e7 and zero acceptance within a few chunks of each t step),
+    # and the re-noise proposal only rescues the chains while t > 0.5.
+    predictor = True
     predictor_noise = 0.0
     # Every renoise_every steps (a multiple of chunk_steps) each chain is
     # proposed a fresh noise realisation of its scene: the Tweedie estimate of
