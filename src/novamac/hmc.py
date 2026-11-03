@@ -175,6 +175,9 @@ def make_log_variance_fn(sde, data_std=None):
 
 # The annealing target
 #####################################################################
+JACOBIANS = ("identity", "scalar", "exact")
+
+
 class Target:
     """
     The annealed log density pi_t(x) = log p_t(x) + log L(y | x_hat(x)) and
@@ -191,15 +194,22 @@ class Target:
     t = 0 (the hold) the plain likelihood is used, so the reported states are
     draws from the true posterior.
 
-    The force is score + grad_x_hat log L by default, i.e. the denoiser's
-    Jacobian is taken as the identity. That costs nothing: the score is the
-    prior's gradient the corrector needs anyway. It does not cost
-    correctness either: the Metropolis test uses the exact log density, and
-    a leapfrog with any position-dependent force is reversible and volume
-    preserving, so HMC remains exact for pi_t; only the acceptance suffers
-    where the Jacobian is far from the identity (large sigma_t). With
-    `exact_jacobian` the missing term sigma^2 * H v (one Hessian-vector
-    product of the prior per evaluation) is added.
+    The force is score + J^T grad_x_hat log L with J the denoiser's
+    Jacobian d x_hat / d x, chosen by `jacobian`:
+      "identity"  J = I. Costs nothing: the score is the prior's gradient
+                  the corrector needs anyway.
+      "scalar"    J = s_a^2 / (sigma_t^2 + s_a^2) on the scene, the Jacobian
+                  of the denoiser of a Gaussian prior of scale s_a
+                  (`jacobian_sigma`; PiGDM's assumption, the one the
+                  broadening makes too). Also free. Suppresses the
+                  likelihood force at large sigma_t, where the identity
+                  overstates it by sigma_t^2 / s_a^2.
+      "exact"     adds the missing term sigma^2 * H v, one Hessian-vector
+                  product of the prior per evaluation (a few times the cost).
+    None of this costs correctness: the Metropolis test uses the exact log
+    density, and a leapfrog with any position-dependent force is reversible
+    and volume preserving, so HMC remains exact for pi_t; only the
+    acceptance suffers where the force is far from the true gradient.
 
     Mean correction (`log_var_fn` given): the scene the likelihood renders is
     shifted by -v(t)/2 in log I, v the residual log-variance of the scene it
@@ -213,10 +223,17 @@ class Target:
     over the residual scatter and the log-level is unbiased. Zero at t = 0.
     """
 
-    def __init__(self, log_lik, log_prior, sigma_fn, scene_mask, tweedie=True, exact_jacobian=False, log_var_fn=None):
+    def __init__(self, log_lik, log_prior, sigma_fn, scene_mask, tweedie=True, jacobian="identity", log_var_fn=None, jacobian_sigma=None):
         self.log_lik, self.log_prior, self.sigma_fn = log_lik, log_prior, sigma_fn
         self.scene_mask = jnp.asarray(scene_mask)
-        self.tweedie, self.exact_jacobian = bool(tweedie), bool(exact_jacobian)
+        self.tweedie = bool(tweedie)
+        if isinstance(jacobian, (bool, np.bool_)):  # the old exact_jacobian flag
+            jacobian = "exact" if jacobian else "identity"
+        if jacobian not in JACOBIANS:
+            raise ValueError(f"jacobian must be one of {JACOBIANS}, got {jacobian!r}")
+        if jacobian == "scalar" and not (jacobian_sigma is not None and float(jacobian_sigma) > 0):
+            raise ValueError("the scalar Jacobian needs jacobian_sigma > 0")
+        self.jacobian, self.jacobian_sigma = jacobian, None if jacobian_sigma is None else float(jacobian_sigma)
         self.log_var_fn = log_var_fn
         self.prior_vg = jax.value_and_grad(log_prior)
         self.lik_vg = jax.value_and_grad(log_lik)
@@ -244,12 +261,22 @@ class Target:
         lp, score = self.prior_vg(x, t)
         x_hat = x + self.shift(t, score)
         ll, g_ll = self.lik_vg(x_hat, extra_var)
-        if self.tweedie and self.exact_jacobian:
+        if self.tweedie and self.jacobian == "exact":
             # (d x_hat / d x)^T g = g + sigma^2 H (M g) on the scene, H the prior's Hessian
             v = g_ll * self.scene_mask
             hvp = jax.jvp(lambda y: self.prior_grad(y, t), (x,), (v,))[1]
             g_ll = g_ll + jnp.where(t > 0, self.sigma_fn(t) ** 2 * hvp * self.scene_mask, 0.0)
+        elif self.tweedie and self.jacobian == "scalar":
+            g_ll = g_ll * jnp.where((t > 0) & (self.scene_mask > 0), self.jacobian_factor(t), 1.0)
         return ll, lp, g_ll, score
+
+    def jacobian_factor(self, t):
+        """s_a^2 / (sigma_t^2 + s_a^2): the scalar Jacobian of the denoiser of a
+        Gaussian prior of scale s_a (1 for the other choices)."""
+        if self.jacobian != "scalar":
+            return jnp.ones_like(jnp.asarray(t, dtype=jnp.float32))
+        s2 = self.jacobian_sigma**2
+        return s2 / (self.sigma_fn(t) ** 2 + s2)
 
     def value_and_grad(self, x, t, extra_var):
         """((log pi_t, (log L, log p_t, prior score)), force), the shape
@@ -259,8 +286,8 @@ class Target:
         return (ll + lp, (ll, lp, score)), g_ll + score
 
 
-def make_target(log_lik, log_prior, sigma_fn, scene_mask, tweedie=True, exact_jacobian=False, log_var_fn=None):
-    return Target(log_lik, log_prior, sigma_fn, scene_mask, tweedie, exact_jacobian, log_var_fn)
+def make_target(log_lik, log_prior, sigma_fn, scene_mask, tweedie=True, jacobian="identity", log_var_fn=None, jacobian_sigma=None):
+    return Target(log_lik, log_prior, sigma_fn, scene_mask, tweedie, jacobian, log_var_fn, jacobian_sigma)
 
 
 # Jacobian diagonal

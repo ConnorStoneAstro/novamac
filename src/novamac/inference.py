@@ -276,11 +276,16 @@ class Novamac:
     # versions of the t = 0 posterior. The broadening then uses the denoiser's
     # residual variance sigma^2 s^2 / (sigma^2 + s^2), s the prior's data scale.
     # Off at t = 0, so the hold samples the plain posterior. The denoiser's
-    # Jacobian is taken as the identity in the force unless tweedie_exact_jacobian
-    # (one extra Hessian-vector product of the prior per evaluation); either way
-    # the Metropolis test is exact for the target.
+    # Jacobian in the force (hmc.Target): "identity", "scalar" (the Jacobian of
+    # a Gaussian prior of scale tweedie_jacobian_sigma, s_a^2 / (sigma_t^2 +
+    # s_a^2), the PiGDM assumption the broadening already makes; None = the
+    # prior's data scale) or "exact" (a Hessian-vector product of the prior per
+    # evaluation). Whatever the choice the Metropolis test is exact for the
+    # target; the identity overstates the likelihood force at large sigma_t by
+    # sigma_t^2 / s_a^2 (lik/prior force ratio ~100 at t = 1, step sizes 1e-5).
     tweedie = True
-    tweedie_exact_jacobian = False
+    tweedie_jacobian = "scalar"
+    tweedie_jacobian_sigma = None
     # Render the scene at x - v_t/2 inside the likelihood, v_t the residual
     # log-variance the broadening uses (hmc.Target): the data constrain the local
     # average of exp(x), which is exp(mu + v/2) for a field with log-mean mu and
@@ -401,7 +406,7 @@ class Novamac:
     prior_scene_factor = 1.0
     prior_widths = {
         "wcs": None,  # arcsec; None = one data pixel
-        "ps_position": 0.5,  # arcsec
+        "ps_position": 0.2,  # arcsec; a data pixel: the input position is at least that good
         "logflux": 3.0,  # natural log of the point source flux
         "psf_n": 0.2,
         "psf_Rd": 0.1,  # relative
@@ -977,14 +982,20 @@ class Novamac:
             )
         scene_mask = np.zeros(dim)
         scene_mask[scene_idx] = 1.0
+        jacobian_sigma = (
+            float(data_std if self.tweedie_jacobian_sigma is None else self.tweedie_jacobian_sigma)
+            if tweedie and self.tweedie_jacobian == "scalar"
+            else None
+        )
         target = make_target(
             log_lik,
             log_prior,
             sigma_fn,
             as_dev(scene_mask),
             tweedie,
-            self.tweedie_exact_jacobian,
+            self.tweedie_jacobian,
             log_var_fn,
+            jacobian_sigma,
         )
         if log_var_fn is not None:
             log(
@@ -992,7 +1003,7 @@ class Novamac:
             )
         # the prior-only target used while the likelihood is off (no likelihood cost at all)
         zero_lik = jax.jit(lambda x, extra_var: jnp.zeros((), dtype=x.dtype))
-        target_off = make_target(zero_lik, log_prior, sigma_fn, as_dev(scene_mask), False, False)
+        target_off = make_target(zero_lik, log_prior, sigma_fn, as_dev(scene_mask), False, "identity")
         if not no_likelihood and self.likelihood_t is not None:
             log(
                 f"likelihood switched on {'from the first annealing step' if self.likelihood_t == 'anneal' else f'once t <= {float(self.likelihood_t):g}'}; "
@@ -1002,11 +1013,12 @@ class Novamac:
             log(
                 f"Tweedie: likelihood evaluated at x + sigma_t^2 * prior score on the scene for t > 0 (plain at t = 0); "
                 f"broadening uses sigma^2 s^2 / (sigma^2 + s^2) with s = {float(data_std):.3g}"
-                + (
-                    "; exact denoiser Jacobian in the force"
-                    if self.tweedie_exact_jacobian
-                    else "; identity Jacobian in the force"
-                )
+                + {
+                    "exact": "; exact denoiser Jacobian in the force",
+                    "identity": "; identity Jacobian in the force",
+                    "scalar": f"; scalar denoiser Jacobian s_a^2 / (sigma_t^2 + s_a^2) in the force, s_a = {jacobian_sigma:.3g} "
+                    f"(factor {float(target.jacobian_factor(t_start)):.3g} at t_start)",
+                }[self.tweedie_jacobian]
             )
         pflow_reference = None
         for line in self.init_info["report"]:

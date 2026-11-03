@@ -332,3 +332,34 @@ def test_renoise_move_keeps_a_gaussian_target_invariant():
     key, k = jax.random.split(key)
     _, acc, _, _, _ = bare(jax.random.split(k, chains), x, 0.5, jnp.zeros(1))
     assert float(acc.mean()) < 0.8
+
+
+def test_scalar_jacobian_is_exact_for_an_isotropic_gaussian_prior(toy):
+    """For a Gaussian prior of scale s_a the denoiser's Jacobian is
+    s_a^2 / (sigma_t^2 + s_a^2) I, so the "scalar" force equals the "exact"
+    one (and differs from the "identity" one where sigma_t is large)."""
+    s_a = 1.5
+    mu = jnp.asarray(toy["prior_mean"])
+
+    def log_prior(x, t):
+        return -0.5 * jnp.sum((x - mu) ** 2 / (s_a**2 + sigma_fn(t) ** 2))
+
+    mask = jnp.ones(D)
+    targets = {
+        j: make_target(toy["log_lik"], log_prior, sigma_fn, mask, True, j, None, s_a if j == "scalar" else None)
+        for j in ("identity", "scalar", "exact")
+    }
+    x = jnp.asarray(toy["x_true"]) + 0.3
+    for t in (1.0, 0.7, 0.4, 0.1):
+        parts = {j: targets[j].parts(x, t, broaden_fn(t)) for j in targets}
+        for j in ("scalar", "exact"):  # same density whatever the force
+            assert np.allclose(parts[j][0], parts["identity"][0]) and np.allclose(parts[j][1], parts["identity"][1])
+        g_scalar, g_exact, g_id = (np.asarray(parts[j][2]) for j in ("scalar", "exact", "identity"))
+        assert np.allclose(g_scalar, g_exact, rtol=1e-4, atol=1e-5), (t, g_scalar, g_exact)
+        factor = s_a**2 / (sigma_fn(t) ** 2 + s_a**2)
+        assert np.allclose(g_scalar, factor * g_id, rtol=1e-5)
+        assert float(targets["scalar"].jacobian_factor(t)) == pytest.approx(factor, rel=1e-5)
+    with pytest.raises(ValueError):
+        make_target(toy["log_lik"], log_prior, sigma_fn, mask, True, "scalar")
+    with pytest.raises(ValueError):
+        make_target(toy["log_lik"], log_prior, sigma_fn, mask, True, "bogus")

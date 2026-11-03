@@ -150,8 +150,10 @@ def diagnose_stall(nm, n_last=4):
         log_lik = jax.jit(lambda x, extra_var: jnp.zeros((), dtype=x.dtype))
     # the target exactly as the sampler built it: Tweedie, the mean correction and the Jacobian choice
     log_var_fn = make_log_variance_fn(sde, float(data_std) if tweedie else None) if bool(trace.get("mean_correction", False)) else None
-    target = make_target(log_lik, log_prior, sigma_fn, jnp.asarray(scene_mask, DTYPE), tweedie,
-                         bool(settings.get("tweedie_exact_jacobian", nm.tweedie_exact_jacobian)), log_var_fn)  # fmt: skip
+    jacobian = settings.get("tweedie_jacobian", "exact" if settings.get("tweedie_exact_jacobian", False) else nm.tweedie_jacobian)
+    jacobian_sigma = settings.get("tweedie_jacobian_sigma", nm.tweedie_jacobian_sigma)
+    target = make_target(log_lik, log_prior, sigma_fn, jnp.asarray(scene_mask, DTYPE), tweedie, jacobian, log_var_fn,
+                         float(data_std) if jacobian_sigma is None else jacobian_sigma)  # fmt: skip
     out(f"target: tweedie {tweedie}, mean correction {log_var_fn is not None}, likelihood {settings.get('likelihood', True)}")
     finals = []
     for c in range(C):
