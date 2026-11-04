@@ -69,6 +69,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from . import _backend
 from ._backend import DTYPE
 from .align import refine_alignment
 from .build_likelihood import build_likelihood
@@ -85,6 +86,7 @@ from .hmc import (
     make_linear_gibbs_fn,
     make_log_parts,
     make_log_variance_fn,
+    make_nuisance_log_lik,
     make_nuisance_log_prior,
     sampler_sde,
     make_renoise_fn,
@@ -265,6 +267,19 @@ class Novamac:
     # of its posterior width per transition.
     nuisance_hmc = True
     nuisance_integration_steps = 10
+    # The non-scene sub-step's likelihood gradient is taken with respect to
+    # the non-scene coordinates only (hmc.make_nuisance_log_lik), so the
+    # renderer's adjoint into the 16k scene pixels is not computed and
+    # discarded nuisance_integration_steps times per step. True restores
+    # the full-vector gradient masked afterwards (same numbers, slower).
+    nuisance_full_gradient = False
+    # jax matmul / convolution precision for float32 ("highest", "high" or
+    # "default"; see _backend): "default" lets Ampere GPUs run the prior's
+    # convolutions on tensor cores in TF32, several times faster, at the
+    # cost of ~1e-3 relative rounding in the network output that the energy's
+    # 1/sigma factor amplifies in the log density the Metropolis test sees.
+    # Applied at the start of sample() (it changes what jax compiles).
+    matmul_precision = "highest"
     # A chain that has fallen behind the others on the data (its log-likelihood
     # more than restart_loglik_gap below the top chain's at the end of
     # restart_chunks consecutive chunks) is proposed the top chain's state
@@ -940,6 +955,9 @@ class Novamac:
         rng = jax.random.key(self.seed if seed is None else seed)
         files = self.files
         files.mkdir()
+        if self.matmul_precision != _backend.MATMUL_PRECISION:
+            _backend.configure(self.matmul_precision)
+        log(f"matmul precision {_backend.MATMUL_PRECISION}, backend {jax.default_backend()}")
 
         with Timer("build model", timings):
             model = self.build_model()
@@ -1004,6 +1022,11 @@ class Novamac:
         pix = model.models.pixelated_batch_model.model
         scene_idx = block_indices(model, [pix.I])
         scene_dev_idx = jnp.asarray(scene_idx)
+        nuisance_idx = np.setdiff1d(np.arange(dim), scene_idx)
+        log_lik_nuisance = (
+            None if self.nuisance_full_gradient or log_prior_nuisance is None
+            else make_nuisance_log_lik(model, group1, pix.I)
+        )
         prior_offset_table = None
         if self.prior_energy_offset:
             rng, key_off = jax.random.split(rng)
@@ -1356,6 +1379,7 @@ class Novamac:
                 target if on else target_off, broaden_fn, sigma_fn, self.num_integration_steps, n, self.mass_sigma_fraction,
                 self.predictor_noise, max_abs_scene=self.max_abs_log_scene, predictor=self.predictor,
                 nuisance_log_prior=log_prior_nuisance if nuis else None, nuisance_steps=self.nuisance_integration_steps,
+                nuisance_log_lik=log_lik_nuisance if nuis else None, nuisance_idx=nuisance_idx, scene_idx=scene_idx,
             )
         )  # fmt: skip
         lik_on = self._likelihood_on(0, t_start)

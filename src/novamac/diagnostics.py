@@ -29,7 +29,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._backend import DTYPE, MATMUL_PRECISION
+from . import _backend
+from ._backend import DTYPE
 from .hmc import make_broadening_fn, make_chunk_runner, make_log_parts, make_log_variance_fn, make_sigma_fn, make_target, sampler_sde
 from .products import load_chain_state, num_saved_states, read_scene_history
 from .sampler import calibrate_prior_offset, parameter_blocks
@@ -184,7 +185,7 @@ def diagnose_stall(nm, n_last=4):
 
     # 2b. numerical resolution of the log density at the final state (t = 0)
     out(f"log density resolution at the final state, t = 0 (the Metropolis test needs ~0.01); "
-        f"matmul precision = {MATMUL_PRECISION}, backend = {jax.default_backend()}:")
+        f"matmul precision = {_backend.MATMUL_PRECISION}, backend = {jax.default_backend()}:")
     ev0 = broaden_fn(0.0) * jj
     lp_a = float(log_lik(x, ev0)) + float(log_prior(x, 0.0))
     lp_b = float(log_lik(x + 0.0, ev0)) + float(log_prior(x + 0.0, 0.0))

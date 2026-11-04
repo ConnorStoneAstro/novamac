@@ -110,6 +110,37 @@ def make_nuisance_log_prior(model, group1):
 
 
 
+def make_nuisance_log_lik(model, group1, scene_param):
+    """log_lik_nuisance(x_nuis, scene, extra_var): the log likelihood with the
+    scene given separately, for a gradient with respect to the non-scene
+    coordinates only. `x_nuis` is the group-0 vector without the scene
+    (its entries in order), `scene` the scene's entries (x[scene_idx]).
+
+    The scene parameter is moved to caskade group 2 while the function is
+    traced and put back afterwards, so the model is filled from
+    (x_nuis, group1, scene) and the scene is an ordinary non-differentiated
+    argument at the JAX level: JAX then never emits the renderer's adjoint
+    with respect to the scene pixels, which a full-vector gradient masked
+    afterwards would compute and throw away (the non-scene sub-step runs
+    nuisance_integration_steps of those per step). Not jitted: it is traced
+    inside the chunk runner. Only valid while the scene is in group 0 and is
+    the model's only group-2 candidate (checked)."""
+    if scene_param.group != 0:
+        raise ValueError(f"the scene parameter {scene_param.name} is in group {scene_param.group}, expected 0")
+
+    def log_lik_nuisance(x_nuis, scene, extra_var):
+        scene_param.group = 2
+        try:
+            if model.dynamic_param_groups != (0, 1, 2):
+                raise ValueError(f"unexpected parameter groups {model.dynamic_param_groups} with the scene in group 2")
+            with ck.ValidContext(model):
+                return model.log_likelihood(params=(x_nuis, group1, scene), extra_var=extra_var)
+        finally:
+            scene_param.group = 0
+
+    return log_lik_nuisance
+
+
 def flat_index(model, group=0):
     """
     One entry per element of the flat parameter vector, in order:
@@ -523,6 +554,9 @@ def make_chunk_runner(
     predictor=True,
     nuisance_log_prior=None,
     nuisance_steps=10,
+    nuisance_log_lik=None,
+    nuisance_idx=None,
+    scene_idx=None,
 ):
     """
     Build the jitted, chain-vmapped function that advances every chain by
@@ -563,7 +597,12 @@ def make_chunk_runner(
     scene), each step is predictor -> HMC on the scene coordinates -> HMC on
     the released non-scene coordinates with the scene held fixed, the latter
     with its own step size `step_size_nuis` and `nuisance_steps` leapfrog
-    steps and its own acceptance (trace keys *_nuis). Each sub-step is a
+    steps and its own acceptance (trace keys *_nuis). With `nuisance_log_lik`
+    (make_nuisance_log_lik) and the index arrays `nuisance_idx` / `scene_idx`
+    (numpy, complementary), that sub-step differentiates the likelihood with
+    respect to the non-scene coordinates only; without them it takes the
+    full gradient and masks the scene part (the renderer's scene adjoint is
+    then computed for nothing). Each sub-step is a
     valid kernel for the joint target with the other block fixed. The
     non-scene step sees the same scene the scene step does, x_hat (Tweedie
     + mean correction), formed from the score the scene step already
@@ -598,11 +637,27 @@ def make_chunk_runner(
         if nuisance_log_prior is not None:
             # the non-scene sub-step's target: likelihood at the (fixed) denoised
             # scene + the Gaussian nuisance prior; no host prior evaluation
-            def _nuis_logp(y, t, ev):
-                ll = target.log_lik(y, ev)
-                lpn = nuisance_log_prior(y)
-                return ll + lpn, (ll, lpn, jnp.zeros_like(y))
-            nuis_value_and_grad = jax.value_and_grad(_nuis_logp, has_aux=True)
+            if nuisance_log_lik is None:
+                def _nuis_logp(y, t, ev):
+                    ll = target.log_lik(y, ev)
+                    lpn = nuisance_log_prior(y)
+                    return ll + lpn, (ll, lpn, jnp.zeros_like(y))
+                nuis_value_and_grad = jax.value_and_grad(_nuis_logp, has_aux=True)
+            else:
+                nidx = jnp.asarray(nuisance_idx)
+                sidx = jnp.asarray(scene_idx)
+
+                def nuis_value_and_grad(y, t, ev):
+                    # gradient with respect to the non-scene entries only; the
+                    # scene enters as a non-differentiated argument (see
+                    # make_nuisance_log_lik), the returned gradient is zero there
+                    def logp(y_nuis):
+                        ll = nuisance_log_lik(y_nuis, y[sidx], ev)
+                        lpn = nuisance_log_prior(y.at[nidx].set(y_nuis))
+                        return ll + lpn, (ll, lpn, jnp.zeros_like(y))
+
+                    (val, aux), g_nuis = jax.value_and_grad(logp, has_aux=True)(y[nidx])
+                    return (val, aux), jnp.zeros_like(y).at[nidx].set(g_nuis)
 
         def reflect_scene(x):
             # scene coordinates folded back into the box (no-op when bound = inf);
