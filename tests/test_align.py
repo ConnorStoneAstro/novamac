@@ -16,7 +16,7 @@ def test_alignment_recovers_known_offsets(prior_dir, tmp_path):
     offset[6] = (-0.5 * pix, 0.2 * pix)  # a transient epoch too
     wrong = dict(inputs)
     wrong["crtan"] = inputs["crtan"] + offset
-    nm = Novamac(prior=prior_dir, out_dir=tmp_path, verbose=False, init_align_steps=150, **wrong)
+    nm = Novamac(prior=prior_dir, out_dir=tmp_path, verbose=False, init_align_steps=150, init_align_max_shift=1.0, **wrong)
     model = nm.build_model()
     info = nm.align_info
     assert info is not None and info["accepted"][1] and info["accepted"][6]
@@ -24,7 +24,7 @@ def test_alignment_recovers_known_offsets(prior_dir, tmp_path):
     assert np.allclose(recovered[1], -offset[1], atol=0.12 * pix), recovered[1] / pix
     # a transient epoch aligns on the pixels outside the transient's aperture only, so less precisely
     assert np.allclose(recovered[6], -offset[6], atol=0.3 * pix), recovered[6] / pix
-    assert np.all(np.abs(recovered) <= Novamac.init_align_max_shift * pix + 1e-9)
+    assert np.all(np.abs(recovered) <= nm.init_align_max_shift * pix + 1e-9)
     untouched = np.abs(recovered[inputs["is_template"]][[0, 2, 3, 4]])
     assert np.all(untouched < 0.4 * pix), f"untouched epochs stay close: {untouched / pix} px"
     assert np.sum(np.where(info["accepted"], info["chi2_after"], info["chi2_before"])) < np.sum(info["chi2_before"])

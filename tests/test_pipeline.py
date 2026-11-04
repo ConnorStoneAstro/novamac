@@ -140,7 +140,7 @@ def test_prior_t_min_remaps_the_prior_time(tmp_path, prior_dir, synthetic):
     inputs, _ = synthetic
     models = {}
     for t_min in (0.0, 0.1):
-        nm = Novamac(prior=prior_dir, out_dir=tmp_path / f"out{t_min}", name="syn_g", **FAST_SETTINGS, prior_t_min=t_min, **inputs)
+        nm = Novamac(prior=prior_dir, out_dir=tmp_path / f"out{t_min}", name="syn_g", **dict(FAST_SETTINGS, prior_t_min=t_min), **inputs)
         models[t_min] = nm.build_model()
     plain, floor = models[0.0], models[0.1]
     host = plain.meta.host_prior.sde
@@ -157,7 +157,7 @@ def test_prior_t_min_remaps_the_prior_time(tmp_path, prior_dir, synthetic):
     for t in (0.0, 0.5, 1.0):
         assert float(lp_floor(x, t)) == pytest.approx(float(lp_plain(x, 0.1 + 0.9 * t)), rel=1e-5)
     with pytest.raises(ValueError, match="prior_t_min"):
-        Novamac(prior=prior_dir, out_dir=tmp_path / "bad", name="syn_g", **FAST_SETTINGS, prior_t_min=1.0, **inputs).build_model()
+        Novamac(prior=prior_dir, out_dir=tmp_path / "bad", name="syn_g", **dict(FAST_SETTINGS, prior_t_min=1.0), **inputs).build_model()
 
 
 def test_predictor_only_ramps_below_a_t_threshold(tmp_path, prior_dir, synthetic):

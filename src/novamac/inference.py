@@ -146,12 +146,12 @@ class Novamac:
     # scene itself a start above sigma ~ 2 froze the chains (pixels many
     # e-folds from the data, a doubly exponential penalty as t decreases).
     sigma_start = None
-    warmup_steps = 256  # at t = t_start, HMC only
-    anneal_steps = 4096  # t from t_start down to 0 (plateaus excluded)
+    warmup_steps = 1024  # at t = t_start, HMC only
+    anneal_steps = 4352  # t from t_start down to 0 (plateaus excluded)
     # fraction(s) of t_start at which the anneal pauses (when plateau_steps > 0):
-    # a number or a sequence; the default is ten evenly spaced pauses
-    plateau_at = tuple(k / 11.0 for k in range(10, 0, -1))
-    plateau_steps = 512  # steps at each fixed t inside the anneal; the anneal phase is anneal_steps + plateau_steps * (number of plateaus) long
+    # a number or a sequence; the default is sixteen evenly spaced pauses
+    plateau_at = tuple(k / 17.0 for k in range(16, 0, -1))
+    plateau_steps = 256  # steps at each fixed t inside the anneal; the anneal phase is anneal_steps + plateau_steps * (number of plateaus) long
     hold_steps = 512  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
     # The step sizes keep adapting for this many chunks of the hold (the cut at
     # the hold start is a guess) and are then frozen, chain restarts stop, and
@@ -180,20 +180,21 @@ class Novamac:
     # (log density -1e7 and zero acceptance within a few chunks of each t step),
     # and the re-noise proposal only rescues the chains while t > 0.5.
     predictor = True
-    predictor_noise = 0.0
+    predictor_noise = 1.0
     # Anneal ramps as plain prior diffusion: on a chunk where t decreases at
     # every step only the predictor runs (no corrector, no non-scene step, no
     # Gibbs refresh, no re-noise, no step size adaptation), so the chain hops
     # from one noise level to the next under the prior alone and the likelihood
     # acts only on the plateaus and the hold. Needs plateaus, and the warmup,
     # every ramp segment and every plateau must be whole chunks
-    # (sampler.ramp_chunks); e.g. 16 plateaus of 256 with anneal_steps 4352.
-    ramp_predictor_only = False
+    # (sampler.ramp_chunks); the default schedule is 16 plateaus of 256 with
+    # anneal_steps 4352 (ramps of 256 steps).
+    ramp_predictor_only = True
     # ... and only on the ramps that start at t <= ramp_predictor_below (the
     # plateau t they ramp down from); the ramps above keep the corrector. At
     # large sigma an eta = 1 predictor hop throws a bright-host scene far from
     # the data and a short plateau does not recover it. 1 = every ramp.
-    ramp_predictor_below = 1.0
+    ramp_predictor_below = 0.6
     # Every renoise_every steps (a multiple of chunk_steps) each chain is
     # proposed a fresh noise realisation of its scene: the Tweedie estimate of
     # the clean scene noised back up to sigma_t (plus the denoiser's residual
@@ -225,18 +226,18 @@ class Novamac:
     # expectation be absorbed by one coordinate instead of by every scene
     # pixel. freeze_scene_scale keeps it at the unit conversion. It is always
     # frozen in the prior-only and frozen test modes, where nothing constrains it.
-    freeze_scene_scale = False
+    freeze_scene_scale = True
     # Blocks (by name, see sampler.BLOCK_NAMES) never released whatever
     # release_t says: they stay at their initial values, e.g. ("sky",) to keep
     # the sky levels handed to the constructor.
     frozen_blocks = ()
     release_t = {
-        "scene_scale": 0.7,  # the scene's overall scale factor: free from the start (if not frozen)
-        "sky": 0.7,
-        "alignment": 0.7,  # per-image crtan
-        "ps_flux": 0.4,
-        "ps_center": 0.4,
-        "psf": 0.4,
+        "scene_scale": 1,  # the scene's overall scale factor: free from the start (if not frozen)
+        "sky": 1,
+        "alignment": 1,  # per-image crtan
+        "ps_flux": 1,
+        "ps_center": 1,
+        "psf": 1,
     }
     # Blocks listed here are not released at release_t unconditionally: from
     # release_t on, their curvature is probed every release_probe_every chunks and
@@ -314,7 +315,7 @@ class Novamac:
     # average of exp(x), which is exp(mu + v/2) for a field with log-mean mu and
     # scatter v, so without this the log-level is pushed down by v/2 wherever
     # the data have a say and not in the PSF margin (the dark box). Zero at t = 0.
-    mean_correction = True
+    mean_correction = False
     # When the likelihood is switched on, like a parameter block's release time:
     #   None      from the first step (warmup included)
     #   "anneal"  off during the warmup, on from the first annealing step
@@ -418,7 +419,7 @@ class Novamac:
     init_align = True
     init_align_steps = 100
     init_align_rate = 0.05
-    init_align_max_shift = 1.0
+    init_align_max_shift = 0.1
     init_align_min_dchi2 = 6.0
 
     # Prior configuration (build_prior). prior_scene_factor: the host prior is
@@ -435,9 +436,9 @@ class Novamac:
     # the plain-likelihood hold still end at t = 0: it is a posterior under a
     # prior with a slightly larger sigma_min, for a model that is not well
     # trained at its own. 0 = the prior's own sigma_min.
-    prior_t_min = 0.0
+    prior_t_min = 0.1
     prior_widths = {
-        "wcs": None,  # arcsec; None = one data pixel
+        "wcs": 0.02,  # arcsec; None = one data pixel
         "ps_position": 0.2,  # arcsec; a data pixel: the input position is at least that good
         "logflux": 3.0,  # natural log of the point source flux
         "psf_n": 0.2,
@@ -1738,6 +1739,14 @@ class Novamac:
                 log(f"  WARNING: chain {c} step size collapsed to {step_size[c]:.3g}")
 
         save_json(files.timings, timings)
+        try:  # peak device memory of the run (None on CPU)
+            stats = jax.devices()[0].memory_stats()
+            if stats and "peak_bytes_in_use" in stats:
+                timings["peak_device_memory_GB"] = stats["peak_bytes_in_use"] / 1e9
+                save_json(files.timings, timings)
+                log(f"peak device memory {stats['peak_bytes_in_use'] / 1e9:.2f} GB ({self.num_chains} chains)")
+        except Exception:  # noqa: BLE001
+            pass
         log(f"finished {self.name}; total {sum(timings.values()) / 60:.1f} min")
         return trace
 

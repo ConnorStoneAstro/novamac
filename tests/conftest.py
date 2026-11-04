@@ -37,7 +37,20 @@ FAST_SETTINGS = dict(
     anneal_steps=32,
     hold_steps=16,
     save_every=16,
-    plateau_steps=0,  # no plateaus (the package default has ten of 512 steps)
+    plateau_steps=0,  # no plateaus (the package default has sixteen of 256 steps)
+    # the defaults before the Nov 2026 production settings (predictor-only
+    # ramps below t = 0.6, prior_t_min 0.1, every block free from the start,
+    # frozen scene scale, no mean correction, tight WCS and alignment), so
+    # the tests keep exercising the release machinery and the corrector
+    # ramps; the new settings have tests of their own
+    ramp_predictor_only=False,
+    ramp_predictor_below=1.0,
+    predictor_noise=0.0,
+    prior_t_min=0.0,
+    mean_correction=True,
+    freeze_scene_scale=False,
+    init_align_max_shift=1.0,
+    prior_widths={"wcs": None},
     renoise_every=16,  # two re-noise proposals during the warmup + anneal
     hutchinson_probes=8,
     hutchinson_batch=4,
