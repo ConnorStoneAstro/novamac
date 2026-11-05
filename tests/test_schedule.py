@@ -115,5 +115,7 @@ def test_default_schedule_has_whole_chunk_ramps_and_plateaus():
     n = Novamac.chunk_steps
     bounds = [(s, min(s + n, len(ts))) for s in range(0, len(ts), n)]
     pred = ramp_chunks(ts, ts_prev, bounds, Novamac.ramp_predictor_below)  # raises on a mixed chunk
-    # predictor-only: the ramps down from the plateaus at t <= ramp_predictor_below
-    assert pred.sum() == (ramp // n) * sum(f <= Novamac.ramp_predictor_below for f in Novamac.plateau_at)
+    # predictor-only: exactly the ramp chunks that start at t <= ramp_predictor_below
+    ramping = ts < ts_prev
+    expected_pred = [ramping[s0:s1].all() and ts_prev[s0] <= Novamac.ramp_predictor_below for s0, s1 in bounds]
+    assert np.array_equal(pred, expected_pred) and pred.sum() > 0
