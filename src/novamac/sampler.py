@@ -46,7 +46,11 @@ def build_schedule(t_start, warmup_steps, anneal_steps, hold_steps, plateau_at=N
             raise ValueError(f"plateau_at={plateau_at} must be fractions of t_start in (0, 1] when plateau_steps > 0")
         pieces, k0 = [], 0
         for frac in sorted(set(fractions.tolist()), reverse=True):  # highest t first: anneal order
-            k = int(np.argmax(anneal <= frac * t_start))
+            # the first anneal step at or below the fraction, with a tolerance so a
+            # fraction that lands exactly on a step (k/17 with 4352 steps) is not
+            # pushed one step late by rounding, which would break the whole-chunk
+            # ramps of ramp_predictor_only
+            k = int(np.argmax(anneal <= frac * t_start * (1.0 + 1e-9)))
             starts.append(warmup_steps + k + 1 + plateau_steps * len(starts))
             pieces += [anneal[k0 : k + 1], np.full(plateau_steps, anneal[k])]
             k0 = k + 1

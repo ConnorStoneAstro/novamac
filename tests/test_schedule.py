@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from novamac.inference import Novamac
 from novamac.sampler import build_schedule, lagging_chains, ramp_chunks
 
 
@@ -98,3 +99,21 @@ def test_ramp_chunks_classify_whole_chunks_and_reject_mixed_ones():
     ts_prev = np.concatenate([[ts[0]], ts[:-1]])
     with pytest.raises(ValueError, match="mixes"):
         ramp_chunks(ts, ts_prev, [(s, min(s + 8, len(ts))) for s in range(0, len(ts), 8)])
+
+
+def test_default_schedule_has_whole_chunk_ramps_and_plateaus():
+    """The production defaults (t = 1 start, 17 ramps of 256 and 16 plateaus
+    of 256) must land every plateau on a chunk boundary: 1 - 3328/4352 is not
+    bit-identical to 4/17, which once started that plateau one step late."""
+    ts, starts = build_schedule(
+        1.0, Novamac.warmup_steps, Novamac.anneal_steps, Novamac.hold_steps, Novamac.plateau_at, Novamac.plateau_steps
+    )
+    ramp = Novamac.anneal_steps // (len(Novamac.plateau_at) + 1)
+    expected = Novamac.warmup_steps + ramp + np.arange(len(Novamac.plateau_at)) * (ramp + Novamac.plateau_steps)
+    assert np.array_equal(starts, expected), "every plateau starts right after a whole ramp"
+    ts_prev = np.concatenate([[ts[0]], ts[:-1]])
+    n = Novamac.chunk_steps
+    bounds = [(s, min(s + n, len(ts))) for s in range(0, len(ts), n)]
+    pred = ramp_chunks(ts, ts_prev, bounds, Novamac.ramp_predictor_below)  # raises on a mixed chunk
+    # predictor-only: the ramps down from the plateaus at t <= ramp_predictor_below
+    assert pred.sum() == (ramp // n) * sum(f <= Novamac.ramp_predictor_below for f in Novamac.plateau_at)
