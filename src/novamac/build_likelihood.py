@@ -163,7 +163,14 @@ def build_likelihood(
         PA=0.0,
         target=batch_target.images[0],
         integrate_mode="none",
-        sampling_mode="simpsons",
+        # midpoint: the scene grid already has the resolution of the upsampled
+        # render (scene pixel = data pixel / psf_upsample), so Simpson's 3x3
+        # sub-sampling of every rendered pixel (4x the samples, a convolution
+        # to combine them) only reproduces the bilinear interpolant: on a
+        # mock rendered with Simpson the difference is < 0.01 sigma per pixel.
+        # The samples go through a gather whose backward is a scatter-add into
+        # the scene, the likelihood gradient's largest cost.
+        sampling_mode="midpoint",
         psf=psf_model,
         jacobian_maxparams=32,
     )

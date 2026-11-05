@@ -141,6 +141,37 @@ def make_nuisance_log_lik(model, group1, scene_param):
     return log_lik_nuisance
 
 
+def make_scene_log_lik(model, group1, scene_param):
+    """
+    Jitted log_lik_scene(x_scene, x_nuis, extra_var): the likelihood with the
+    scene coordinates as the differentiated argument and every other group-0
+    parameter (x_nuis, their entries in group-0 order with the scene removed,
+    i.e. x[nuisance_idx]) as a non-differentiated one. The scene HMC step only
+    ever uses the scene part of the gradient (the non-scene coordinates move in
+    their own sub-step), so differentiating with respect to the scene alone
+    spares the renderer the PSF and alignment adjoints. Same mechanism as
+    make_nuisance_log_lik: at trace time the other parameters are moved to
+    caskade group 2 and the model called with params=(x_scene, group1, x_nuis).
+    """
+    if scene_param.group != 0:
+        raise ValueError("the scene parameter must be in group 0")
+    others = [p for p in model.dynamic_params if p.group == 0 and p is not scene_param]
+
+    def log_lik_scene(x_scene, x_nuis, extra_var):
+        for p in others:
+            p.group = 2
+        try:
+            if model.dynamic_param_groups != (0, 1, 2):
+                raise ValueError(f"unexpected parameter groups {model.dynamic_param_groups}")
+            with ck.ValidContext(model):
+                return model.log_likelihood(params=(x_scene, group1, x_nuis), extra_var=extra_var)
+        finally:
+            for p in others:
+                p.group = 0
+
+    return jax.jit(log_lik_scene)
+
+
 def flat_index(model, group=0):
     """
     One entry per element of the flat parameter vector, in order:
@@ -264,8 +295,15 @@ class Target:
     over the residual scatter and the log-level is unbiased. Zero at t = 0.
     """
 
-    def __init__(self, log_lik, log_prior, sigma_fn, scene_mask, tweedie=True, jacobian="identity", log_var_fn=None, jacobian_sigma=None):
+    def __init__(self, log_lik, log_prior, sigma_fn, scene_mask, tweedie=True, jacobian="identity", log_var_fn=None, jacobian_sigma=None,
+                 lik_scene=None, scene_idx=None, nuisance_idx=None):
         self.log_lik, self.log_prior, self.sigma_fn = log_lik, log_prior, sigma_fn
+        # with lik_scene (make_scene_log_lik) the likelihood force is taken with
+        # respect to the scene coordinates only (zero elsewhere): for the scene
+        # HMC step when the other coordinates have their own sub-step
+        self.lik_scene = lik_scene
+        self.scene_idx = None if scene_idx is None else jnp.asarray(scene_idx)
+        self.nuisance_idx = None if nuisance_idx is None else jnp.asarray(nuisance_idx)
         self.scene_mask = jnp.asarray(scene_mask)
         self.tweedie = bool(tweedie)
         if isinstance(jacobian, (bool, np.bool_)):  # the old exact_jacobian flag
@@ -297,11 +335,33 @@ class Target:
         score = self.prior_grad(x, t) if self.tweedie else jnp.zeros_like(x)
         return x + self.shift(t, score)
 
+    def lik_force(self, x_hat, extra_var):
+        """(log L, its gradient at x_hat): with respect to every coordinate, or
+        to the scene coordinates only (zero elsewhere) when lik_scene is set."""
+        if self.lik_scene is None:
+            return self.lik_vg(x_hat, extra_var)
+        sidx, nidx = self.scene_idx, self.nuisance_idx
+        ll, g_s = jax.value_and_grad(lambda s: self.lik_scene(s, x_hat[nidx], extra_var))(x_hat[sidx])
+        return ll, jnp.zeros_like(x_hat).at[sidx].set(g_s)
+
     def parts(self, x, t, extra_var):
         """(log L, log p_t, grad log L wrt x (force part), score)."""
         lp, score = self.prior_vg(x, t)
+        return self._parts_from_prior(x, t, extra_var, lp, score)
+
+    def parts_cached(self, x, t, extra_var, lp, score):
+        """parts() with the prior's value and score at (x, t) supplied: for a
+        state whose scene and t are unchanged since they were computed (the
+        non-scene coordinates may have moved: `lp` is then the prior with its
+        non-scene part updated, and `score` is used on the scene only). The
+        exact Jacobian needs the prior anyway and evaluates it."""
+        if self.tweedie and self.jacobian == "exact":
+            return self.parts(x, t, extra_var)
+        return self._parts_from_prior(x, t, extra_var, lp, score)
+
+    def _parts_from_prior(self, x, t, extra_var, lp, score):
         x_hat = x + self.shift(t, score)
-        ll, g_ll = self.lik_vg(x_hat, extra_var)
+        ll, g_ll = self.lik_force(x_hat, extra_var)
         if self.tweedie and self.jacobian == "exact":
             # (d x_hat / d x)^T g = g + sigma^2 H (M g) on the scene, H the prior's Hessian
             v = g_ll * self.scene_mask
@@ -326,9 +386,15 @@ class Target:
         ll, lp, g_ll, score = self.parts(x, t, extra_var)
         return (ll + lp, (ll, lp, score)), g_ll + score
 
+    def value_and_grad_cached(self, x, t, extra_var, lp, score):
+        """value_and_grad with the prior's (value, score) supplied (parts_cached)."""
+        ll, lp, g_ll, score = self.parts_cached(x, t, extra_var, lp, score)
+        return (ll + lp, (ll, lp, score)), g_ll + score
 
-def make_target(log_lik, log_prior, sigma_fn, scene_mask, tweedie=True, jacobian="identity", log_var_fn=None, jacobian_sigma=None):
-    return Target(log_lik, log_prior, sigma_fn, scene_mask, tweedie, jacobian, log_var_fn, jacobian_sigma)
+
+def make_target(log_lik, log_prior, sigma_fn, scene_mask, tweedie=True, jacobian="identity", log_var_fn=None, jacobian_sigma=None,
+                lik_scene=None, scene_idx=None, nuisance_idx=None):
+    return Target(log_lik, log_prior, sigma_fn, scene_mask, tweedie, jacobian, log_var_fn, jacobian_sigma, lik_scene, scene_idx, nuisance_idx)
 
 
 # Jacobian diagonal
@@ -481,21 +547,23 @@ def fold_into_box(x, bound, scene_mask):
 # Predictor step and predictor-only chunk
 #####################################################################
 def make_predictor_step(prior_grad, sigma_fn, predictor_noise, bound):
-    """predictor_step(key, x, t_prev, t, scene_mask) -> (x_new, rms displacement
-    over the scene): one Heun step of the prior's reverse VE diffusion of the
+    """predictor_step(key, x, t_prev, t, scene_mask, g_cur=None) -> (x_new, rms
+    displacement over the scene): one Heun step of the prior's reverse VE diffusion of the
     scene coordinates from sigma(t_prev) to sigma(t),
         dx = -(1 + eta)/2 * d(sigma^2) * score + sqrt(eta * |d(sigma^2)|) * z,
     eta = predictor_noise (1: reverse SDE, 0: probability-flow ODE), reflected
     into |x| <= bound; a no-op when sigma(t) >= sigma(t_prev) and when the
-    step is non-finite."""
+    step is non-finite. g_cur is the prior score at (x, t_prev) when the
+    caller has it (the first Heun stage), else it is evaluated."""
 
-    def predictor_step(key, x, t_prev, t, scene_mask):
+    def predictor_step(key, x, t_prev, t, scene_mask, g_cur=None):
         n_scene = jnp.maximum(jnp.sum(scene_mask), 1.0)
         s_cur, s_new = sigma_fn(t_prev), sigma_fn(t)
         dvar = jnp.maximum(s_cur**2 - s_new**2, 0.0)  # decrease of the noise variance
         drift_coef = 0.5 * (1.0 + predictor_noise) * dvar
         noise = jnp.sqrt(predictor_noise * dvar) * jax.random.normal(key, x.shape, x.dtype) * scene_mask
-        g_cur = prior_grad(x, t_prev)
+        if g_cur is None:  # the score at (x, t_prev); the corrector that produced x already has it
+            g_cur = prior_grad(x, t_prev)
         x_euler, _ = fold_into_box(x + drift_coef * g_cur * scene_mask + noise, bound, scene_mask)
         g_new = prior_grad(x_euler, t)
         x_new, _ = fold_into_box(x + 0.5 * drift_coef * (g_cur + g_new) * scene_mask + noise, bound, scene_mask)
@@ -557,6 +625,8 @@ def make_chunk_runner(
     nuisance_log_lik=None,
     nuisance_idx=None,
     scene_idx=None,
+    reuse_prior=False,
+    carry_score=True,
 ):
     """
     Build the jitted, chain-vmapped function that advances every chain by
@@ -593,6 +663,18 @@ def make_chunk_runner(
 
     predictor=False skips the predictor altogether (corrector-only annealing).
 
+    The prior's score at the state a corrector ends on is carried to the next
+    step: the predictor's first Heun stage uses it instead of evaluating the
+    prior again (carry_score; False re-evaluates, for testing). With
+    reuse_prior (t constant within the chunk, so predictor must be False) the
+    next corrector's initial evaluation reuses the carried prior value and
+    score as well and only renders the likelihood (Target.parts_cached): the
+    scene and t are unchanged, and the non-scene sub-step's change of the
+    prior value is accounted for exactly, provided nuisance_log_prior is the
+    non-scene part of the target's log prior (novamac's model: both are its
+    _nuisance_log_prior). Either way one prior evaluation at the chunk's
+    first state seeds the carry.
+
     With `nuisance_log_prior` given (the Gaussian prior on everything but the
     scene), each step is predictor -> HMC on the scene coordinates -> HMC on
     the released non-scene coordinates with the scene held fixed, the latter
@@ -623,12 +705,20 @@ def make_chunk_runner(
     """
     L = num_integration_steps
     bound = jnp.asarray(max_abs_scene)
+    if reuse_prior and predictor:
+        raise ValueError("reuse_prior needs predictor=False (t constant within the chunk)")
+    seed_carry = reuse_prior or (predictor and carry_score)
+
+    def _inside(val, x, scene_mask):
+        return jnp.where(jnp.all(jnp.abs(x) * scene_mask <= bound), val, -jnp.inf)
 
     def _value_and_grad(x, t, extra_var, scene_mask):
         (val, aux), g = target.value_and_grad(x, t, extra_var)
-        inside = jnp.all(jnp.abs(x) * scene_mask <= bound)
-        val = jnp.where(inside, val, -jnp.inf)
-        return (val, aux), g
+        return (_inside(val, x, scene_mask), aux), g
+
+    def _value_and_grad_cached(x, t, extra_var, scene_mask, lp, score):
+        (val, aux), g = target.value_and_grad_cached(x, t, extra_var, lp, score)
+        return (_inside(val, x, scene_mask), aux), g
 
     predictor_step = make_predictor_step(target.prior_grad, sigma_fn, predictor_noise, bound)
 
@@ -664,15 +754,16 @@ def make_chunk_runner(
             # also returns which coordinates need their momentum flipped
             return fold_into_box(x, bound, scene_mask)
 
-        def corrector(key, x, t, extra_var, inv_mass, active, step_size, n_leap, vg):
+        def corrector(key, x, t, extra_var, inv_mass, active, step_size, n_leap, vg, vg0=None):
             """One HMC transition on the coordinates in `active` with step size
-            `step_size`, `n_leap` leapfrog steps and target value_and_grad `vg`."""
+            `step_size`, `n_leap` leapfrog steps and target value_and_grad `vg`
+            (`vg0`, when given, evaluates the initial state instead)."""
             velocity_scale = inv_mass * active
 
             def kinetic(p):
                 return 0.5 * jnp.sum(velocity_scale * p * p)
 
-            (lp0, aux0), g0 = vg(x, t, extra_var)
+            (lp0, aux0), g0 = (vg if vg0 is None else vg0)(x, t, extra_var)
             key_momentum, key_accept = jax.random.split(key)
             p = jax.random.normal(key_momentum, x.shape, x.dtype) / jnp.sqrt(inv_mass) * active
             ke0 = kinetic(p)
@@ -713,11 +804,14 @@ def make_chunk_runner(
             score = jnp.where(accept, aux1[2], aux0[2])
             return x, (lp, ll, lpr, accept_prob, log_alpha, divergent), score, aux0
 
-        def step(x, inputs):
+        def step(carry, inputs):
+            # carry: the state, and the prior's value and score at it (the
+            # score on the scene is what the next step can reuse; see above)
+            x, lpr_c, score_c = carry
             key, t, t_prev = inputs
             key_pred, key_corr, key_nuis = jax.random.split(key, 3)
             if predictor:
-                x, pred_rms = predictor_step(key_pred, x, t_prev, t, scene_mask)
+                x, pred_rms = predictor_step(key_pred, x, t_prev, t, scene_mask, score_c if carry_score else None)
             else:
                 pred_rms = jnp.zeros((), x.dtype)  # corrector only: HMC tracks the moving target by itself
             extra_var = broaden_fn(t) * jj
@@ -725,12 +819,13 @@ def make_chunk_runner(
             # which is HMC restricted to the active subspace.
             active = (t <= t_release).astype(x.dtype)
             inv_mass = inv_mass0 + mass_sigma_frac * sigma_fn(t) ** 2 * scene_mask
+            vg0 = (lambda y, tt, ev: _value_and_grad_cached(y, tt, ev, scene_mask, lpr_c, score_c)) if reuse_prior else None
             if nuisance_log_prior is None:
-                x, out, _, _ = corrector(key_corr, x, t, extra_var, inv_mass, active, step_size, L, value_and_grad)
+                x, out, score, _ = corrector(key_corr, x, t, extra_var, inv_mass, active, step_size, L, value_and_grad, vg0)
                 out_n = (jnp.nan, jnp.nan, False)
             else:
                 # scene sub-step on the scene coordinates only ...
-                x, out, score, _ = corrector(key_corr, x, t, extra_var, inv_mass, active * scene_mask, step_size, L, value_and_grad)
+                x, out, score, _ = corrector(key_corr, x, t, extra_var, inv_mass, active * scene_mask, step_size, L, value_and_grad, vg0)
                 # ... then the released non-scene coordinates with the scene held
                 # at x_hat, the scene the likelihood sees (free: the score is the
                 # one the scene step ended on)
@@ -747,10 +842,14 @@ def make_chunk_runner(
                 lpr_new = out[2] - lpn_old + lpn_new
                 out = (ll_new + lpr_new, ll_new, lpr_new) + out[3:]
                 out_n = (out_n6[3], out_n6[4], out_n6[5])
-            return x, out + (pred_rms,) + out_n
+            return (x, out[2], score), out + (pred_rms,) + out_n
 
         keys = jax.random.split(key, chunk_steps)
-        x, (lp, ll, lpr, acc, la, div, prms, acc_n, la_n, div_n) = jax.lax.scan(step, x, (keys, ts, ts_prev))
+        if seed_carry:
+            lpr0, score0 = target.prior_vg(x, ts_prev[0])
+        else:
+            lpr0, score0 = jnp.zeros((), x.dtype), jnp.zeros_like(x)
+        (x, _, _), (lp, ll, lpr, acc, la, div, prms, acc_n, la_n, div_n) = jax.lax.scan(step, (x, lpr0, score0), (keys, ts, ts_prev))
         trace = {
             "logdensity": lp, "loglik": ll, "logprior": lpr,
             "accept_prob": acc, "log_alpha": la, "divergent": div, "predictor_rms": prms,

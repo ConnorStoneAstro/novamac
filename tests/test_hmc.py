@@ -397,3 +397,78 @@ def test_predictor_runner_is_the_prior_flow_and_leaves_the_rest_alone(toy):
     ev = broaden_fn(ts[-1]) * jj
     lp_true = np.array([float(toy["log_lik"](x[c], ev) + toy["log_prior"](x[c], ts[-1])) for c in range(C)])
     assert np.allclose(np.asarray(tr["logdensity"])[:, -1], lp_true, rtol=1e-4, atol=1e-3)
+
+
+def _nuisance_setup(toy, tweedie=True):
+    """The toy with coordinate 4 as the non-scene block: target, its scene-only
+    variant, the nuisance prior and a starting state for 16 chains."""
+    scene_mask = jnp.array([1.0, 1.0, 1.0, 1.0, 0.0])
+    scene_idx, nuis_idx = np.array([0, 1, 2, 3]), np.array([4])
+    pm, ps = toy["prior_mean"], toy["prior_sd"]
+    pm_j, ps_j = jnp.asarray(pm), jnp.asarray(ps)
+    # the prior: the scene coordinates broadened by sigma(t), the non-scene
+    # coordinate at its fixed width, and nuisance_log_prior exactly that
+    # non-scene part (as novamac's model has it; the reuse of the prior across
+    # the non-scene move assumes it)
+    log_prior = lambda x, t: -0.5 * jnp.sum((x - pm_j) ** 2 / (ps_j**2 + sigma_fn(t) ** 2 * scene_mask))  # noqa: E731
+    nuisance_log_prior = lambda x: -0.5 * (x[4] - pm[4]) ** 2 / ps[4] ** 2  # noqa: E731
+    lik_scene = lambda s, n, ev: toy["log_lik"](jnp.concatenate([s, n]), ev)  # noqa: E731
+    target = make_target(toy["log_lik"], log_prior, sigma_fn, scene_mask, tweedie=tweedie)
+    target_scene = make_target(toy["log_lik"], log_prior, sigma_fn, scene_mask, tweedie=tweedie,
+                               lik_scene=lik_scene, scene_idx=scene_idx, nuisance_idx=nuis_idx)  # fmt: skip
+    C = 16
+    x0 = jnp.tile(jnp.asarray(pm) + 0.5, (C, 1))
+    jj = jnp.asarray(np.sum(toy["A"] ** 2, axis=1), jnp.float32)
+    return dict(scene_mask=scene_mask, target=target, target_scene=target_scene, nuisance_log_prior=nuisance_log_prior, C=C, x0=x0, jj=jj)
+
+
+def test_scene_only_force_matches_the_masked_gradient(toy):
+    """A Target with lik_scene returns the same density and the same force on
+    the scene coordinates as the full one, and zero force on the others."""
+    su = _nuisance_setup(toy)
+    x = su["x0"][0] + 0.1
+    ev = broaden_fn(0.3) * su["jj"]
+    (v_full, aux_full), g_full = su["target"].value_and_grad(x, 0.3, ev)
+    (v_s, aux_s), g_s = su["target_scene"].value_and_grad(x, 0.3, ev)
+    assert float(v_s) == pytest.approx(float(v_full), rel=1e-6)
+    assert float(aux_s[0]) == pytest.approx(float(aux_full[0]), rel=1e-6)
+    # the force = likelihood gradient (scene only in the scene target) + prior score (both)
+    expected = (g_full - aux_full[2]) * su["scene_mask"] + aux_full[2]
+    np.testing.assert_allclose(np.asarray(g_s), np.asarray(expected), rtol=1e-5, atol=1e-6)
+
+
+def _run(su, target, ts, ts_prev, **kw):
+    runner = make_chunk_runner(target, broaden_fn, sigma_fn, 3, len(ts), 0.5, 1.0, nuisance_log_prior=su["nuisance_log_prior"],
+                               nuisance_steps=3, **kw)  # fmt: skip
+    C, D_ = su["C"], su["x0"].shape[1]
+    return runner(jax.random.split(jax.random.key(5), C), su["x0"], jnp.full(C, 0.05), jnp.full(C, 0.3), jnp.full(D_, 0.05),
+                  jnp.asarray(ts, jnp.float32), jnp.asarray(ts_prev, jnp.float32), su["jj"], jnp.full(D_, jnp.inf), su["scene_mask"])  # fmt: skip
+
+
+def test_reuse_prior_reproduces_the_fresh_evaluation(toy):
+    """At constant t the corrector's initial evaluation with the carried prior
+    value and score (reuse_prior) gives the same chains and trace as
+    evaluating the prior afresh, with the non-scene sub-step moving between
+    steps."""
+    su = _nuisance_setup(toy)
+    ts = np.full(6, 0.2)
+    x_a, tr_a = _run(su, su["target_scene"], ts, ts, predictor=False, reuse_prior=False, carry_score=False)
+    x_b, tr_b = _run(su, su["target_scene"], ts, ts, predictor=False, reuse_prior=True)
+    assert np.asarray(tr_b["accept_prob_nuis"]).mean() > 0.2 and np.asarray(tr_b["accept_prob"]).mean() > 0.2
+    np.testing.assert_allclose(np.asarray(x_b), np.asarray(x_a), rtol=1e-4, atol=1e-4)
+    for k in ("logdensity", "loglik", "logprior", "accept_prob", "accept_prob_nuis"):
+        np.testing.assert_allclose(np.asarray(tr_b[k]), np.asarray(tr_a[k]), rtol=1e-4, atol=1e-4, err_msg=k)
+
+
+def test_carried_score_reproduces_the_predictor(toy):
+    """In a ramp the predictor's first Heun stage with the score carried from
+    the corrector gives the same chains and trace as evaluating it afresh."""
+    su = _nuisance_setup(toy)
+    ts = np.linspace(0.5, 0.1, 6)
+    ts_prev = np.concatenate([[0.6], ts[:-1]])
+    x_a, tr_a = _run(su, su["target_scene"], ts, ts_prev, predictor=True, carry_score=False)
+    x_b, tr_b = _run(su, su["target_scene"], ts, ts_prev, predictor=True, carry_score=True)
+    assert np.asarray(tr_b["predictor_rms"]).mean() > 0
+    np.testing.assert_allclose(np.asarray(x_b), np.asarray(x_a), rtol=1e-4, atol=1e-4)
+    for k in ("logdensity", "predictor_rms", "accept_prob"):
+        np.testing.assert_allclose(np.asarray(tr_b[k]), np.asarray(tr_a[k]), rtol=1e-4, atol=1e-4, err_msg=k)

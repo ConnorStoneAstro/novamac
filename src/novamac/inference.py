@@ -87,6 +87,7 @@ from .hmc import (
     make_log_parts,
     make_log_variance_fn,
     make_nuisance_log_lik,
+    make_scene_log_lik,
     make_nuisance_log_prior,
     sampler_sde,
     make_renoise_fn,
@@ -273,6 +274,19 @@ class Novamac:
     # discarded nuisance_integration_steps times per step. True restores
     # the full-vector gradient masked afterwards (same numbers, slower).
     nuisance_full_gradient = False
+    # Likewise the scene step, which only ever moves the scene while the
+    # non-scene sub-step exists, differentiates the likelihood with respect to
+    # the scene coordinates only (hmc.make_scene_log_lik): the PSF and
+    # alignment adjoints are not rendered to be masked away. True takes the
+    # full gradient.
+    scene_full_gradient = False
+    # Chunks over which t is constant (the hold, the plateaus) run without the
+    # predictor and reuse the prior's value and score across the non-scene
+    # move for the corrector's initial evaluation (hmc.make_chunk_runner,
+    # reuse_prior): the scene has not moved, so only the likelihood is
+    # rendered; in the ramps the predictor's first Heun stage reuses the
+    # score the corrector ended on. Exact; False re-evaluates (for A/B tests).
+    reuse_prior_score = True
     # jax matmul / convolution precision for float32 ("highest", "high" or
     # "default"; see _backend): "default" lets Ampere GPUs run the prior's
     # convolutions on tensor cores in TF32, several times faster, at the
@@ -1027,6 +1041,10 @@ class Novamac:
             None if self.nuisance_full_gradient or log_prior_nuisance is None
             else make_nuisance_log_lik(model, group1, pix.I)
         )
+        log_lik_scene = (
+            None if self.scene_full_gradient or log_prior_nuisance is None or no_likelihood
+            else make_scene_log_lik(model, group1, pix.I)
+        )
         prior_offset_table = None
         if self.prior_energy_offset:
             rng, key_off = jax.random.split(rng)
@@ -1059,6 +1077,14 @@ class Novamac:
             log_var_fn,
             jacobian_sigma,
         )
+        # the scene step's target: the likelihood force on the scene only (the
+        # same density; make_score_fn and the curvature probes keep `target`)
+        target_scene = (
+            make_target(log_lik, log_prior, sigma_fn, as_dev(scene_mask), tweedie, self.tweedie_jacobian, log_var_fn, jacobian_sigma,
+                        lik_scene=log_lik_scene, scene_idx=scene_idx, nuisance_idx=nuisance_idx)
+            if log_lik_scene is not None
+            else target
+        )  # fmt: skip
         if log_var_fn is not None:
             log(
                 f"mean correction: the likelihood renders the scene at x - v_t/2 (v_{{t_start}}/2 = {0.5 * float(log_var_fn(t_start)):.3g} in log I)"
@@ -1372,14 +1398,19 @@ class Novamac:
             lambda t: inv_mass0 + self.mass_sigma_fraction * float(sigma_fn(t)) ** 2 * scene_mask
         )  # noqa: E731
         runners = {}
-        make_runner = lambda n, on, nuis, pred: (  # noqa: E731
+        # runners are cached by (chunk length, likelihood on, non-scene step on,
+        # predictor-only chunk, constant-t chunk): a constant-t chunk (hold,
+        # plateau) skips the predictor and reuses the prior across steps
+        make_runner = lambda n, on, nuis, pred, const=False: (  # noqa: E731
             make_predictor_runner(target if on else target_off, broaden_fn, sigma_fn, n, self.predictor_noise, self.max_abs_log_scene)
             if pred
             else make_chunk_runner(
-                target if on else target_off, broaden_fn, sigma_fn, self.num_integration_steps, n, self.mass_sigma_fraction,
-                self.predictor_noise, max_abs_scene=self.max_abs_log_scene, predictor=self.predictor,
+                # the scene-only force only where the non-scene coordinates have their own sub-step
+                (target_scene if nuis else target) if on else target_off, broaden_fn, sigma_fn, self.num_integration_steps, n, self.mass_sigma_fraction,
+                self.predictor_noise, max_abs_scene=self.max_abs_log_scene, predictor=self.predictor and not const,
                 nuisance_log_prior=log_prior_nuisance if nuis else None, nuisance_steps=self.nuisance_integration_steps,
                 nuisance_log_lik=log_lik_nuisance if nuis else None, nuisance_idx=nuisance_idx, scene_idx=scene_idx,
+                reuse_prior=const and self.reuse_prior_score, carry_score=self.reuse_prior_score,
             )
         )  # fmt: skip
         lik_on = self._likelihood_on(0, t_start)
@@ -1427,9 +1458,9 @@ class Novamac:
                     nuis_on = True
 
         with Timer("initial step size search (includes compile)", timings):
-            runners[(1, lik_on, nuis_on, False)] = make_runner(1, lik_on, nuis_on, False)
+            runners[(1, lik_on, nuis_on, False, False)] = make_runner(1, lik_on, nuis_on, False)
             rng, step_size, step_size_nuis = find_initial_step_size(
-                runners[(1, lik_on, nuis_on, False)],
+                runners[(1, lik_on, nuis_on, False, False)],
                 rng,
                 positions,
                 inv_mass0,
@@ -1598,11 +1629,13 @@ class Novamac:
                     log(f"probed {b.name} at step {s0} (t={ts[s0]:.3f}), stays frozen: {summary}")
 
             pred_only = bool(pred_chunks[ci])  # a predictor-only ramp chunk
-            if (n, lik_on, nuis_on, pred_only) not in runners:
-                runners[(n, lik_on, nuis_on, pred_only)] = make_runner(n, lik_on, nuis_on, pred_only)
+            const_t = (not pred_only) and bool(np.all(ts_prev[s0:s1] == ts[s0:s1]))  # the target does not move: hold, plateau
+            rkey = (n, lik_on, nuis_on, pred_only, const_t)
+            if rkey not in runners:
+                runners[rkey] = make_runner(n, lik_on, nuis_on, pred_only, const_t)
             rng, key = jax.random.split(rng)
             with Timer("sampling", timings, quiet=True) as tm:
-                positions, ctrace = runners[(n, lik_on, nuis_on, pred_only)](
+                positions, ctrace = runners[rkey](
                     jax.random.split(key, C), positions, as_dev(step_size), as_dev(step_size_nuis), inv_mass0_dev,
                     as_dev(ts[s0:s1]), as_dev(ts_prev[s0:s1]), jj_dev, as_dev(t_release), scene_mask_dev,
                 )  # fmt: skip

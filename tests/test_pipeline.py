@@ -239,3 +239,34 @@ def test_nuisance_log_lik_matches_the_masked_full_gradient(tmp_path, prior_dir, 
     np.testing.assert_allclose(np.asarray(g_n), np.asarray(g_full)[nuis_idx], rtol=1e-5, atol=1e-6 * float(jnp.abs(g_full).max()))
     assert pix.I.group == 0 and model.dynamic_param_groups == (0, 1)
     assert float(log_lik(x + 0.01, ev)) == pytest.approx(float(jax.value_and_grad(log_lik)(x + 0.01, ev)[0]))
+
+
+def test_scene_log_lik_matches_the_masked_full_gradient(tmp_path, prior_dir, synthetic):
+    """make_scene_log_lik: same likelihood value as log_lik, its gradient with
+    respect to the scene equals the full gradient's scene entries, and the
+    model's parameter groups are restored."""
+    import jax
+    import caskade as ck
+    from novamac.hmc import block_indices, make_log_parts, make_scene_log_lik
+
+    inputs, _ = synthetic
+    nm = Novamac(prior=prior_dir, out_dir=tmp_path / "out", name="syn_g", **FAST_SETTINGS, **inputs)
+    model = nm.build_model()
+    with ck.ValidContext(model):
+        x0, group1 = model.get_values()
+    x = jnp.asarray(x0, DTYPE) + 0.05
+    group1 = jnp.asarray(group1, DTYPE)
+    pix = model.models.pixelated_batch_model.model
+    scene_idx = block_indices(model, [pix.I])
+    nuis_idx = np.setdiff1d(np.arange(x.shape[0]), scene_idx)
+    log_lik, _, _ = make_log_parts(model, group1)
+    log_lik_scene = make_scene_log_lik(model, group1, pix.I)
+    ev = jnp.zeros(())
+    v_full, g_full = jax.value_and_grad(log_lik)(x, ev)
+    vg = jax.jit(jax.value_and_grad(lambda s, y_n: log_lik_scene(s, y_n, ev)))
+    v_s, g_s = vg(x[scene_idx], x[nuis_idx])
+    assert float(v_s) == pytest.approx(float(v_full), rel=1e-6)
+    np.testing.assert_allclose(np.asarray(g_s), np.asarray(g_full)[scene_idx], rtol=1e-5, atol=1e-6 * float(jnp.abs(g_full).max()))
+    assert pix.I.group == 0 and model.dynamic_param_groups == (0, 1)
+    assert all(p.group in (0, 1) for p in model.dynamic_params)
+    assert float(log_lik(x + 0.01, ev)) == pytest.approx(float(jax.value_and_grad(log_lik)(x + 0.01, ev)[0]))
