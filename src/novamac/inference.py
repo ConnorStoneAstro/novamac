@@ -149,13 +149,17 @@ class Novamac:
     # scene itself a start above sigma ~ 2 froze the chains (pixels many
     # e-folds from the data, a doubly exponential penalty as t decreases).
     sigma_start = None
-    warmup_steps = 1024  # at t = t_start, HMC only
-    anneal_steps = 4352  # t from t_start down to 0 (plateaus excluded)
+    warmup_steps = 512  # at t = t_start, HMC only (the chains look settled by then)
+    anneal_steps = 640  # t from t_start down to 0 (plateaus excluded): five predictor-only ramps of 128
     # fraction(s) of t_start at which the anneal pauses (when plateau_steps > 0):
-    # a number or a sequence; the default is sixteen evenly spaced pauses
-    plateau_at = tuple(k / 17.0 for k in range(16, 0, -1))
-    plateau_steps = 256  # steps at each fixed t inside the anneal; the anneal phase is anneal_steps + plateau_steps * (number of plateaus) long
-    hold_steps = 512  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
+    # a number or a sequence; the default is four evenly spaced pauses. Few,
+    # long plateaus: the predictor-only ramps break the scene's fit to the
+    # data, and the plateaus' HMC heals it fast (a descent to the nearby good
+    # region, then exploration), so the steps go to the plateaus rather than
+    # to a gentler anneal.
+    plateau_at = (0.8, 0.6, 0.4, 0.2)
+    plateau_steps = 1024  # steps at each fixed t inside the anneal; the anneal phase is anneal_steps + plateau_steps * (number of plateaus) long
+    hold_steps = 1024  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
     # The step sizes keep adapting for this many chunks of the hold (the cut at
     # the hold start is a guess) and are then frozen, chain restarts stop, and
     # the states saved from then on (trace "draws_from_step") are the posterior
@@ -190,14 +194,15 @@ class Novamac:
     # from one noise level to the next under the prior alone and the likelihood
     # acts only on the plateaus and the hold. Needs plateaus, and the warmup,
     # every ramp segment and every plateau must be whole chunks
-    # (sampler.ramp_chunks); the default schedule is 16 plateaus of 256 with
-    # anneal_steps 4352 (ramps of 256 steps).
+    # (sampler.ramp_chunks); the default schedule is 4 plateaus of 1024 with
+    # anneal_steps 640 (ramps of 128 steps).
     ramp_predictor_only = True
     # ... and only on the ramps that start at t <= ramp_predictor_below (the
     # plateau t they ramp down from); the ramps above keep the corrector. At
     # large sigma an eta = 1 predictor hop throws a bright-host scene far from
-    # the data and a short plateau does not recover it. 1 = every ramp.
-    ramp_predictor_below = 0.6
+    # the data and a short plateau does not recover it; the default's long
+    # plateaus do, so every ramp is predictor-only. 1 = every ramp.
+    ramp_predictor_below = 1.0
     # Every renoise_every steps (a multiple of chunk_steps) each chain is
     # proposed a fresh noise realisation of its scene: the Tweedie estimate of
     # the clean scene noised back up to sigma_t (plus the denoiser's residual
@@ -267,7 +272,7 @@ class Novamac:
     # 1e-3, and with the Gauss-Newton mass every coordinate then moves ~eps * L
     # of its posterior width per transition.
     nuisance_hmc = True
-    nuisance_integration_steps = 10
+    nuisance_integration_steps = 8
     # The non-scene sub-step's likelihood gradient is taken with respect to
     # the non-scene coordinates only (hmc.make_nuisance_log_lik), so the
     # renderer's adjoint into the 16k scene pixels is not computed and
@@ -306,9 +311,11 @@ class Novamac:
     # the prior energy of the margin pixels differs by ~1e4 between chains
     # that agree on the data; the test uses the density because that is the
     # target. Restarts stop when the draws start. A restarted chain shares
-    # its past with its source, so the chains are no longer independent;
-    # prefer that to a chain stuck in a bad mode.
-    restart_lagging_chains = True
+    # its past with its source, so the chains are no longer independent.
+    # Off by default: with the long plateaus it hardly ever fired, and a bad
+    # chain seen through to the end can be judged and rejected, or heals on
+    # its own, whereas a copied one hides the failure.
+    restart_lagging_chains = False
     restart_loglik_gap = 2000.0
     restart_from_t = 0.7
     restart_chunks = 2

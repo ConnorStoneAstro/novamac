@@ -123,13 +123,16 @@ def plot_progress(nm, trace=None):
 
     ratio = lambda a, b: np.where((a > 0) & (b > 0), a / np.where(b > 0, b, 1.0), np.nan)  # noqa: E731
     offset_in = "prior_offset_value" in trace
+    ll0 = float(np.nanmedian(trace["loglik"][0, :n_chains]))
+    lp0 = float(np.nanmedian(trace["logprior"][0, :n_chains]))
     for c in range(n_chains):
         color = CHAIN_COLORS[c % len(CHAIN_COLORS)]
         ax_lp.plot(steps, trace["logdensity"][:done, c], lw=0.8, color=color, label=f"chain {c}")
-        # change since the first step: the absolute values are dominated by
+        # change since the first step (one baseline for all chains, the median
+        # over chains at step 0, so the chains compare): the absolute values are dominated by
         # constants and the prior's 1/sigma scaling and tell nothing by eye
-        ax_parts.plot(steps, trace["loglik"][:done, c] - trace["loglik"][0, c], lw=0.8, color=color, label=f"chain {c} log L")
-        ax_prior.plot(steps, trace["logprior"][:done, c] - (0.0 if offset_in else trace["logprior"][0, c]), lw=0.8, ls="--", color=color, label=f"chain {c} log prior")
+        ax_parts.plot(steps, trace["loglik"][:done, c] - ll0, lw=0.8, color=color, label=f"chain {c} log L")
+        ax_prior.plot(steps, trace["logprior"][:done, c] - (0.0 if offset_in else lp0), lw=0.8, ls="--", color=color, label=f"chain {c} log prior")
         ax_acc.plot(steps, running_mean(trace["accept_prob"][:done, c], 64), lw=0.8, color=color)
         ax_eps.plot(chunk_step[:n_chunks], trace["step_size"][:n_chunks, c], lw=0.8, ls=":", color=color)
         if "accept_prob_nuis" in trace and np.any(np.isfinite(trace["accept_prob_nuis"][:done, c])):
@@ -152,9 +155,9 @@ def plot_progress(nm, trace=None):
 
     ax_lp.set_ylabel("log posterior density")
     ax_lp.legend(loc="lower right", fontsize=8)
-    ax_parts.set_ylabel("log L - log L(step 0)")
+    ax_parts.set_ylabel("log L - median over chains of log L(step 0)")
     ax_parts.legend(loc="lower left", fontsize=8)
-    ax_prior.set_ylabel("log prior relative to a typical noised scene (dashed)" if offset_in else "log prior - log prior(step 0) (dashed)")
+    ax_prior.set_ylabel("log prior relative to a typical noised scene (dashed)" if offset_in else "log prior - median over chains of log prior(step 0) (dashed)")
     ax_prior.legend(loc="lower right", fontsize=8)
     ax_acc.set_ylabel("acceptance (running mean; dash-dot: non-scene HMC)")
     ax_acc.set_ylim(0, 1)
