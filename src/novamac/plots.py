@@ -63,6 +63,20 @@ from .utils import Timer, get_fluxes, log  # noqa: E402
 CHAIN_COLORS = ["tab:red", "tab:blue", "tab:green", "tab:orange", "tab:purple"]
 
 
+def chain_color(c, n_chains):
+    """Colour of chain c: the five named colours for a few chains, tab20 (20
+    distinct colours) beyond that so a 16-chain run still tells chains apart."""
+    if n_chains <= len(CHAIN_COLORS):
+        return CHAIN_COLORS[c]
+    return plt.get_cmap("tab20")(c % 20)
+
+
+def chain_key(fig, n_chains, **kw):
+    """One colour key for the whole figure: a figure-level legend of the chain colours."""
+    handles = [plt.Line2D([], [], color=chain_color(c, n_chains), lw=2, label=f"chain {c}") for c in range(n_chains)]
+    return fig.legend(handles=handles, ncol=min(n_chains, 8), fontsize=7, frameon=False, **kw)
+
+
 def running_mean(x, window):
     """Running mean that ignores nan (nan where the window holds no finite value)."""
     window = max(1, min(window, len(x)))
@@ -126,64 +140,57 @@ def plot_progress(nm, trace=None):
     ll0 = float(np.nanmedian(trace["loglik"][0, :n_chains]))
     lp0 = float(np.nanmedian(trace["logprior"][0, :n_chains]))
     for c in range(n_chains):
-        color = CHAIN_COLORS[c % len(CHAIN_COLORS)]
-        ax_lp.plot(steps, trace["logdensity"][:done, c], lw=0.8, color=color, label=f"chain {c}")
+        color = chain_color(c, n_chains)
+        ax_lp.plot(steps, trace["logdensity"][:done, c], lw=0.8, color=color)
         # change since the first step (one baseline for all chains, the median
         # over chains at step 0, so the chains compare): the absolute values are dominated by
         # constants and the prior's 1/sigma scaling and tell nothing by eye
-        ax_parts.plot(steps, trace["loglik"][:done, c] - ll0, lw=0.8, color=color, label=f"chain {c} log L")
-        ax_prior.plot(steps, trace["logprior"][:done, c] - (0.0 if offset_in else lp0), lw=0.8, ls="--", color=color, label=f"chain {c} log prior")
+        ax_parts.plot(steps, trace["loglik"][:done, c] - ll0, lw=0.8, color=color)
+        ax_prior.plot(steps, trace["logprior"][:done, c] - (0.0 if offset_in else lp0), lw=0.8, ls="--", color=color)
         ax_acc.plot(steps, running_mean(trace["accept_prob"][:done, c], 64), lw=0.8, color=color)
         ax_eps.plot(chunk_step[:n_chunks], trace["step_size"][:n_chunks, c], lw=0.8, ls=":", color=color)
         if "accept_prob_nuis" in trace and np.any(np.isfinite(trace["accept_prob_nuis"][:done, c])):
             an = trace["accept_prob_nuis"][:done, c]
-            ax_acc.plot(steps, running_mean(np.where(np.isfinite(an), an, np.nan), 64), lw=0.8, ls="-.", color=color,
-                        label="non-scene HMC acceptance (dash-dot)" if c == 0 else None)  # fmt: skip
+            ax_acc.plot(steps, running_mean(np.where(np.isfinite(an), an, np.nan), 64), lw=0.8, ls="-.", color=color)
             ax_eps.plot(chunk_step[:n_chunks], trace["step_size_nuis"][:n_chunks, c], lw=0.6, ls="--", color=color)
         if "gibbs_accept" in trace:
             ga = trace["gibbs_accept"][:n_chunks, c]
             ok = np.isfinite(ga)
-            ax_acc.scatter(chunk_step[:n_chunks][ok], ga[ok], s=6, marker="^", color=color, alpha=0.6,
-                           label="linear Gibbs: fraction of images accepted" if c == 0 else None)  # fmt: skip
+            ax_acc.scatter(chunk_step[:n_chunks][ok], ga[ok], s=6, marker="^", color=color, alpha=0.6)
         sc = trace["scores"][:n_chunks, c]
         # what drives the scene: |likelihood score| / |prior score| on the scene block
-        ax_score.plot(chunk_step[:n_chunks], ratio(sc[:, si["lik_mnorm_scene"]], sc[:, si["prior_mnorm_scene"]]), lw=0.8, color=color, label=f"chain {c} metric weighted")
-        ax_score.plot(chunk_step[:n_chunks], ratio(sc[:, si["lik_norm_scene"]], sc[:, si["prior_norm_scene"]]), lw=0.8, ls="--", color=color, label=f"chain {c} raw")
+        ax_score.plot(chunk_step[:n_chunks], ratio(sc[:, si["lik_mnorm_scene"]], sc[:, si["prior_mnorm_scene"]]), lw=0.8, color=color)
+        ax_score.plot(chunk_step[:n_chunks], ratio(sc[:, si["lik_norm_scene"]], sc[:, si["prior_norm_scene"]]), lw=0.8, ls="--", color=color)
         ax_cos.plot(chunk_step[:n_chunks], sc[:, si["cos_scene"]], lw=0.6, ls=":", color=color)
         div_steps = steps[trace["divergent"][:done, c]]
         ax_div.plot(div_steps, np.full(len(div_steps), c), "|", color=color, ms=10)
 
     ax_lp.set_ylabel("log posterior density")
-    ax_lp.legend(loc="lower right", fontsize=8)
-    ax_parts.set_ylabel("log L - median over chains of log L(step 0)")
-    ax_parts.legend(loc="lower left", fontsize=8)
-    ax_prior.set_ylabel("log prior relative to a typical noised scene (dashed)" if offset_in else "log prior - median over chains of log prior(step 0) (dashed)")
-    ax_prior.legend(loc="lower right", fontsize=8)
-    ax_acc.set_ylabel("acceptance (running mean; dash-dot: non-scene HMC)")
+    ax_parts.set_ylabel("log L - median chains log L(step 0)\n(solid)")
+    ax_prior.set_ylabel("log prior relative to a typical\nnoised scene (dashed)" if offset_in else "log prior - median chains log prior(step 0)\n(dashed)")
+    ax_acc.set_ylabel("acceptance (running mean)\nscene HMC solid, non-scene dash-dot,\nGibbs fraction of images triangles")
     ax_acc.set_ylim(0, 1)
-    ax_eps.set_ylabel("step size (dotted)")
+    ax_eps.set_ylabel("step size\nscene dotted, non-scene dashed")
     ax_eps.set_yscale("log")
     ax_score.axhline(1.0, color="k", lw=0.5)
-    ax_score.set_ylabel("scene |score L| / |score prior|")
+    ax_score.set_ylabel("scene |score L| / |score prior|\nmetric-weighted solid, raw dashed")
     ax_score.set_yscale("log")
-    ax_score.legend(loc="upper right", fontsize=8)
     ax_cos.set_ylabel("cos(score_L, score_prior) (dotted)")
     ax_cos.set_ylim(-1, 1)
     # predictor displacement (solid, left) and the fixed mass matrix's block
     # medians (dotted, right)
     ax_massr = ax_mass.twinx()
     for c in range(n_chains):
-        color = CHAIN_COLORS[c % len(CHAIN_COLORS)]
+        color = chain_color(c, n_chains)
         pr = trace["predictor_rms"][:done, c]
-        ax_mass.plot(steps, np.where(pr > 0, pr, np.nan), lw=0.6, color=color, label=f"chain {c} predictor rms")
+        ax_mass.plot(steps, np.where(pr > 0, pr, np.nan), lw=0.6, color=color)
     if "inv_mass0" in trace:
         for name in ["scene"] + [str(n) for n in trace["block_names"]]:
             idx = trace["scene_idx"] if name == "scene" else trace[f"block_idx_{name}"]
             med = np.full(n_chunks, float(np.median(trace["inv_mass0"][idx])))
             ax_massr.plot(chunk_step[:n_chunks], med, lw=0.8, ls=":", label=name)
     ax_mass.set_yscale("log")
-    ax_mass.set_ylabel("predictor rms displacement (scene)")
-    ax_mass.legend(loc="upper left", fontsize=7)
+    ax_mass.set_ylabel("predictor rms displacement (scene, solid)")
     ax_massr.set_yscale("log")
     ax_massr.set_ylabel("inv_mass0 block median (dotted)")
     ax_massr.legend(loc="upper right", fontsize=7, ncol=3)
@@ -198,7 +205,9 @@ def plot_progress(nm, trace=None):
             ax.axvline(step, color="k", ls=":", lw=0.6)
         ax_lp.text(step, ax_lp.get_ylim()[1], label, fontsize=7, va="top", ha="right", rotation=90)
 
-    fig.suptitle(f"{nm.name}: sampling progress")
+    # title and the chain colour key sit right above the first panel
+    ax_lp.set_title(f"{nm.name}: sampling progress", pad=24)
+    chain_key(fig, n_chains, loc="lower center", bbox_to_anchor=(0.5, 1.0), bbox_transform=ax_lp.transAxes)
     path = nm.files.figure("sample_progress")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
@@ -212,7 +221,7 @@ def _trace_panel(ax, saved_step, series, n_chains, trace, ylabel, log_scale=Fals
     if band is not None:
         ax.axhspan(band[0], band[1], color="0.9", zorder=0)
     for c in range(n_chains):
-        color = CHAIN_COLORS[c % len(CHAIN_COLORS)]
+        color = chain_color(c, n_chains)
         arr = np.asarray(series[c])
         for k in range(arr.shape[1]):
             ax.plot(saved_step[: arr.shape[0]], arr[:, k], lw=0.6, color=color, alpha=0.5)
@@ -239,7 +248,7 @@ def plot_lightcurve(nm, fluxes=None, trace=None):
     for p in range(P):
         fig, ax = plt.subplots(figsize=(8, 5))
         for c in range(n_chains):
-            color = CHAIN_COLORS[c % len(CHAIN_COLORS)]
+            color = chain_color(c, n_chains)
             for k in np.where(~final)[0]:
                 ax.scatter(x[keep], fluxes[c, k, p, keep], s=4, c="0.6", alpha=0.3, lw=0)
             for k in np.where(final)[0]:
@@ -272,7 +281,7 @@ def plot_flux_traces(nm, fluxes=None, trace=None):
     for p in range(P):
         fig, ax = plt.subplots(figsize=(10, 5))
         for c in range(n_chains):
-            color = CHAIN_COLORS[c % len(CHAIN_COLORS)]
+            color = chain_color(c, n_chains)
             for n in keep:
                 ax.plot(saved_step, fluxes[c, :, p, n], lw=0.6, color=color, alpha=0.5)
             ax.plot([], [], color=color, label=f"chain {c}")
