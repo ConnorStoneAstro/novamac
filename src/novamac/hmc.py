@@ -581,23 +581,26 @@ def make_predictor_runner(target, broaden_fn, sigma_fn, chunk_steps, predictor_n
     steps of the prior's reverse diffusion of the scene, no corrector, no
     non-scene move. Same call signature and trace keys as the chunk runner
     (the step sizes, inverse mass and t_release are accepted and ignored),
-    so the host loop can swap it in for a chunk. The logged density is pi_t
-    at the state each step ends on (one target evaluation per step, for the
-    trace and the lagging-chain check); accept_prob, log_alpha and the
-    *_nuis keys are nan / False.
+    so the host loop can swap it in for a chunk. The likelihood plays no part
+    in the move and is not evaluated: the trace's logprior is log p_t at the
+    state each step ends on (its score is carried into the next step's first
+    Heun stage, so each step costs two prior evaluations), and logdensity,
+    loglik, accept_prob, log_alpha and the *_nuis keys are nan / False.
     """
     predictor_step = make_predictor_step(target.prior_grad, sigma_fn, predictor_noise, jnp.asarray(max_abs_scene))
 
     def single_chain(key, x, step_size, step_size_nuis, inv_mass0, ts, ts_prev, jj, t_release, scene_mask):
-        def step(x, inputs):
+        def step(carry, inputs):
+            x, score = carry
             key, t, t_prev = inputs
-            x, pred_rms = predictor_step(key, x, t_prev, t, scene_mask)
-            (lp, (ll, lpr, _)), _ = target.value_and_grad(x, t, broaden_fn(t) * jj)
+            x, pred_rms = predictor_step(key, x, t_prev, t, scene_mask, g_cur=score)
+            lpr, score = target.prior_vg(x, t)  # log p_t at the new state; the score seeds the next step
             nan = jnp.asarray(jnp.nan, x.dtype)
-            return x, (lp, ll, lpr, nan, nan, False, pred_rms, nan, nan, False)
+            return (x, score), (nan, nan, lpr, nan, nan, False, pred_rms, nan, nan, False)
 
         keys = jax.random.split(key, chunk_steps)
-        x, (lp, ll, lpr, acc, la, div, prms, acc_n, la_n, div_n) = jax.lax.scan(step, x, (keys, ts, ts_prev))
+        _, score0 = target.prior_vg(x, ts_prev[0])
+        (x, _), (lp, ll, lpr, acc, la, div, prms, acc_n, la_n, div_n) = jax.lax.scan(step, (x, score0), (keys, ts, ts_prev))
         trace = {
             "logdensity": lp, "loglik": ll, "logprior": lpr,
             "accept_prob": acc, "log_alpha": la, "divergent": div, "predictor_rms": prms,

@@ -371,8 +371,8 @@ def test_predictor_runner_is_the_prior_flow_and_leaves_the_rest_alone(toy):
     ODE of the toy's Gaussian prior N(pm, ps^2 + sigma_t^2), whose exact flow
     from sigma_a to sigma_b scales x - pm by sqrt((ps^2 + sigma_b^2) /
     (ps^2 + sigma_a^2)) on the scene coordinates; the non-scene coordinate
-    must not move, the likelihood never enters the move, and the trace
-    reports pi_t at the returned state with nan acceptance."""
+    must not move, the likelihood is never evaluated, and the trace reports
+    log p_t at the returned state with nan log density and acceptance."""
     scene_mask = jnp.array([1.0, 1.0, 1.0, 1.0, 0.0])
     pm, ps = toy["prior_mean"], toy["prior_sd"]
     target = make_target(toy["log_lik"], toy["log_prior"], sigma_fn, scene_mask, tweedie=False)
@@ -394,9 +394,9 @@ def test_predictor_runner_is_the_prior_flow_and_leaves_the_rest_alone(toy):
     assert set(tr) == {"logdensity", "loglik", "logprior", "accept_prob", "log_alpha", "divergent", "predictor_rms",
                        "accept_prob_nuis", "log_alpha_nuis", "divergent_nuis"}  # fmt: skip
     assert np.all(np.isnan(np.asarray(tr["accept_prob"]))) and np.all(np.asarray(tr["predictor_rms"]) > 0)
-    ev = broaden_fn(ts[-1]) * jj
-    lp_true = np.array([float(toy["log_lik"](x[c], ev) + toy["log_prior"](x[c], ts[-1])) for c in range(C)])
-    assert np.allclose(np.asarray(tr["logdensity"])[:, -1], lp_true, rtol=1e-4, atol=1e-3)
+    assert np.all(np.isnan(np.asarray(tr["logdensity"]))) and np.all(np.isnan(np.asarray(tr["loglik"])))
+    lpr_true = np.array([float(toy["log_prior"](x[c], ts[-1])) for c in range(C)])
+    assert np.allclose(np.asarray(tr["logprior"])[:, -1], lpr_true, rtol=1e-4, atol=1e-3)
 
 
 def _nuisance_setup(toy, tweedie=True):

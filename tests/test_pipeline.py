@@ -170,7 +170,7 @@ def test_predictor_only_ramps_below_a_t_threshold(tmp_path, prior_dir, synthetic
     )  # fmt: skip
     nm = Novamac(prior=prior_dir, out_dir=tmp_path / "out", name="syn_g_ramps_low", **s, **inputs)
     trace = nm.sample()
-    assert np.all(np.isfinite(trace["logdensity"])) and float(trace["prior_t_min"]) == 0.1
+    assert float(trace["prior_t_min"]) == 0.1
     t = np.asarray(trace["t"])
     t_prev = np.concatenate([[t[0]], t[:-1]])
     n = s["chunk_steps"]
@@ -184,6 +184,9 @@ def test_predictor_only_ramps_below_a_t_threshold(tmp_path, prior_dir, synthetic
     acc = np.asarray(trace["accept_prob"])
     assert np.all(np.isnan(acc[pred])) and np.all(np.isfinite(acc[~pred]))
     assert int(np.sum(trace["predictor_chunks"])) == int(np.sum(starts <= 0.6))
+    # the predictor-only ramps evaluate no likelihood: log density nan there, log prior everywhere
+    lp = np.asarray(trace["logdensity"])
+    assert np.all(np.isnan(lp[pred])) and np.all(np.isfinite(lp[~pred])) and np.all(np.isfinite(trace["logprior"]))
 
 
 def test_predictor_only_ramp_run(tmp_path, prior_dir, synthetic):
@@ -195,10 +198,20 @@ def test_predictor_only_ramp_run(tmp_path, prior_dir, synthetic):
     nm = Novamac(prior=prior_dir, out_dir=tmp_path / "out", name="syn_g_ramps", **s, **inputs)
     trace = nm.sample()
     total = s["warmup_steps"] + s["anneal_steps"] + 3 * s["plateau_steps"] + s["hold_steps"]
-    assert int(trace["steps_done"]) == total and np.all(np.isfinite(trace["logdensity"]))
+    assert int(trace["steps_done"]) == total
     t = np.asarray(trace["t"])
     ramp = np.concatenate([[False], t[1:] < t[:-1]])
     assert ramp.sum() == s["anneal_steps"]
+    # the ramps are plain prior diffusion and evaluate no likelihood: log density
+    # and log likelihood nan there, log prior finite everywhere, and the chunk-end
+    # diagnostics (scores, chunk_logdensity, chunk_loglik) nan on the ramp chunks
+    lp, ll = np.asarray(trace["logdensity"]), np.asarray(trace["loglik"])
+    assert np.all(np.isnan(lp[ramp])) and np.all(np.isnan(ll[ramp])), "a ramp step evaluated the likelihood"
+    assert np.all(np.isfinite(lp[~ramp])) and np.all(np.isfinite(trace["logprior"]))
+    pc = np.asarray(trace["predictor_chunks"], dtype=bool)
+    cl = np.asarray(trace["chunk_logdensity"])[: len(pc)]
+    assert np.all(np.isnan(cl[pc])) and np.all(np.isfinite(cl[~pc]))
+    assert np.all(np.isnan(np.asarray(trace["scores"])[: len(pc)][pc]))
     acc, prms = np.asarray(trace["accept_prob"]), np.asarray(trace["predictor_rms"])
     assert np.all(np.isnan(acc[ramp])) and np.all(prms[ramp] > 0), "ramp steps are predictor-only"
     assert np.all(np.isfinite(acc[~ramp])) and np.allclose(prms[~ramp], 0.0, atol=1e-5), "fixed-t steps are HMC without predictor"

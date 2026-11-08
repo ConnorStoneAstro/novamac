@@ -1705,15 +1705,22 @@ class Novamac:
 
             # Diagnostics at the end of the chunk, with the parameters used in it;
             # the log density is that of the state the chunk ends on (after the
-            # Gibbs refresh and the re-noise move), which is what the restart check below compares
-            with Timer("scores", timings, quiet=True):
-                scores, logp_post = score_fns[lik_on](
-                    positions, t_chunk, jj_dev, as_dev(inv_mass_at(t_chunk))
-                )
-                scores, logp_end = np.asarray(scores), np.asarray(logp_post)
+            # Gibbs refresh and the re-noise move), which is what the restart check
+            # below compares. A predictor-only ramp chunk is plain prior diffusion:
+            # the likelihood of its noised scene tells nothing, so it is not evaluated
+            # (scores, chunk_logdensity and chunk_loglik stay nan there)
+            if pred_only:
+                scores = np.full((C, len(SCORE_FIELDS)), np.nan)
+                logp_end = ll_end = np.full(C, np.nan)
+            else:
+                with Timer("scores", timings, quiet=True):
+                    scores, logp_post = score_fns[lik_on](
+                        positions, t_chunk, jj_dev, as_dev(inv_mass_at(t_chunk))
+                    )
+                    scores, logp_end = np.asarray(scores), np.asarray(logp_post)
+                ll_end = np.asarray(ctrace["loglik"])[:, -1]
             trace["scores"][ci] = scores
             trace["chunk_logdensity"][ci] = logp_end
-            ll_end = np.asarray(ctrace["loglik"])[:, -1]
             trace["chunk_loglik"][ci] = ll_end
             trace["step_size"][ci] = step_size
 
@@ -1748,8 +1755,9 @@ class Novamac:
                 )
 
             # Chains lagging on the likelihood are proposed the top chain's state
-            # (Metropolis on the full density; until the draws start)
-            if self.restart_lagging_chains and C > 1 and adapting and lik_on and t_chunk <= self.restart_from_t:
+            # (Metropolis on the full density; until the draws start; not after a
+            # predictor-only ramp chunk, whose likelihood is not evaluated)
+            if self.restart_lagging_chains and C > 1 and adapting and lik_on and not pred_only and t_chunk <= self.restart_from_t:
                 lagging, lag_chunks = lagging_chains(ll_end, lag_chunks, self.restart_loglik_gap, self.restart_chunks)
                 if lagging.any():
                     best = int(np.argmax(ll_end))
@@ -1803,8 +1811,11 @@ class Novamac:
             log(
                 f"step {s1}/{total} t={t_chunk:.3f} [{self.phase_of(s1)}] {tm.elapsed:.1f} s | "
                 f"acc {fmt(acceptance)} | eps {fmt(step_size)} | pred rms {fmt(pred)} | "
-                f"logp {fmt(np.asarray(ctrace['logdensity'])[:, -1])} | "
-                f"div {n_div} | scene score lik/prior {fmt(lik_over_prior)}"
+                + (
+                    f"log prior {fmt(np.asarray(ctrace['logprior'])[:, -1])} | div {n_div}"  # the ramps evaluate no likelihood
+                    if pred_only
+                    else f"logp {fmt(np.asarray(ctrace['logdensity'])[:, -1])} | div {n_div} | scene score lik/prior {fmt(lik_over_prior)}"
+                )
                 + (
                     f" | nuis acc {fmt(acceptance_nuis)} eps {fmt(step_size_nuis)}"
                     if nuis_on
@@ -1812,7 +1823,7 @@ class Novamac:
                 )
                 + (f" | gibbs acc {fmt(gibbs_acc)}" if gibbs_acc is not None else "")
             )
-            if not np.all(np.isfinite(np.asarray(ctrace["logdensity"]))):
+            if not np.all(np.isfinite(np.asarray(ctrace["logprior" if pred_only else "logdensity"]))):
                 log("  WARNING: non-finite log density in this chunk")
             for c in np.where(acceptance < self.stuck_acceptance)[0]:
                 log(f"  WARNING: chain {c} looks stuck (acceptance {acceptance[c]:.3f})")
