@@ -73,7 +73,7 @@ from . import _backend
 from ._backend import DTYPE
 from .align import refine_alignment
 from .build_likelihood import build_likelihood
-from .build_prior import build_prior
+from .build_prior import build_prior, training_floor
 from .hmc import (
     SCORE_FIELDS,
     adapt_step_size,
@@ -475,8 +475,10 @@ class Novamac:
     # shift, mass and offset table all follow that schedule). The anneal and
     # the plain-likelihood hold still end at t = 0: it is a posterior under a
     # prior with a slightly larger sigma_min, for a model that is not well
-    # trained at its own. 0 = the prior's own sigma_min.
-    prior_t_min = 0.1
+    # trained at its own. 0 = the prior's own sigma_min. The ncsnpp_energy_v2
+    # prior needed 0.1; the ncsnpp_encoder priors are used on their own
+    # schedule, t = 1 to 0.
+    prior_t_min = 0.0
     prior_widths = {
         "wcs": 0.02,  # arcsec; None = one data pixel
         "ps_position": 0.2,  # arcsec; a data pixel: the input position is at least that good
@@ -764,10 +766,11 @@ class Novamac:
 
     def _initial_scene(self, crtan):
         """The initial scene stacked with the given image offsets (init_scene.prepare_initial_scene)."""
+        floor, pedestal, _ = training_floor(self.prior)
         return prepare_initial_scene(
             self.data, self.weight, self.mask, self.is_template, self.crpix, crtan, self.CD, self.scene_shape,
-            self.scene_pixel_scale, self.ps_center[0], scene_scale=self.scene_scale0, softening=self.prior.transform.softening,
-            prior_scene_factor=self.prior_scene_factor, init_image=self.init_image, sky=self._sky_px,
+            self.scene_pixel_scale, self.ps_center[0], scene_scale=self.scene_scale0, transform=self.prior.transform,
+            floor=floor, pedestal=pedestal, prior_scene_factor=self.prior_scene_factor, init_image=self.init_image, sky=self._sky_px,
             threshold_sigma=self.init_threshold_sigma, fill_sigma=self.init_fill_sigma, min_templates=self.init_min_templates,
             subsample=self.init_subsample,
         )  # fmt: skip

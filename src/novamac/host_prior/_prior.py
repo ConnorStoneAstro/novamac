@@ -20,8 +20,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._net import NCSNpp, NCSNppEnergy
-from ._support import NCSNppConfig
+from ._net import NCSNpp, NCSNppEncoderEnergy, NCSNppEnergy
+from ._support import EnergyModel, NCSNppConfig
 
 _LINEAR_BELOW = -20.0
 _EXPM1_ABOVE = 30.0
@@ -39,6 +39,12 @@ def _softplus(u, xp):
     return np.logaddexp(0.0, u)
 
 
+def _sigmoid(u, xp):
+    if xp is not np:
+        return jax.nn.sigmoid(u)
+    return 0.5 * (np.tanh(0.5 * u) + 1.0)
+
+
 # -- the flux transform ----------------------------------------------------
 
 
@@ -51,20 +57,41 @@ class LogFluxTransform:
     """
 
     softening: float
+    #: Hand ``floor - pedestal`` back above the knee so bright flux is exact.
+    #: Read from the checkpoint; absent in one written before the term
+    #: existed, where it is False and the map is what it always was.
+    restore_bright_end: bool = False
 
-    def soften(self, flux, floor=0.0):
-        """``floor + s * softplus((f - floor) / s)``: nJy in, nJy out.
+    def soften(self, flux, floor=0.0, pedestal=None):
+        """``pedestal + s * softplus((f - floor) / s)``: nJy in, nJy out.
 
-        ``floor`` is where the map bends over -- the flux the sky is carried
-        towards and never goes below -- and ``s`` is how sharp the bend is.
-        The training loader passes a *per stamp* floor, a multiple of that
-        cutout's own sky noise; ``floor = 0`` is the original one-parameter
-        softening exactly.
+        ``floor`` is where the map bends over, ``pedestal`` is what it bends
+        over *to* -- the faintest flux the prior can represent -- and ``s`` is
+        how sharp the bend is.  The training loader passes a *per stamp*
+        floor, a multiple of that cutout's own sky noise, and one pedestal for
+        the whole set.  ``pedestal = None`` means "the same as floor".
+
+        **The bright end is not the identity** when they differ: the map tends
+        to ``f - (floor - pedestal)``, about 13 nJy low at the trained scales.
+        So ``inverse`` (``exp(x)``) is that much under the real flux however
+        bright the pixel, and ``inverse_exact`` is the one that recovers a
+        measurement.
+
+        Unless ``restore_bright_end`` is set, which adds ``(floor - pedestal)
+        * sigmoid((f - floor) / s)`` -- zero at the floor, the whole offset
+        above it -- and makes the bright end exact again.  It costs a gain
+        above one in a ring around the floor, and the closed-form inverse.
         """
         xp = _xp(flux)
-        return floor + self.softening * _softplus((flux - floor) / self.softening, xp)
+        if pedestal is None:
+            pedestal = floor
+        u = (flux - floor) / self.softening
+        out = pedestal + self.softening * _softplus(u, xp)
+        if self.restore_bright_end:
+            out = out + (floor - pedestal) * _sigmoid(u, xp)
+        return out
 
-    def forward(self, flux, floor=0.0):
+    def forward(self, flux, floor=0.0, pedestal=None):
         """nJy -> the model's space.  Finite for every real input, negative sky
         included.
 
@@ -75,10 +102,18 @@ class LogFluxTransform:
         """
         xp = _xp(flux)
         s = self.softening
+        if pedestal is None:
+            pedestal = floor
         u = (flux - floor) / s
-        val = self.soften(flux, floor)
-        limit = u + math.log(s)
-        degenerate = (xp.asarray(floor) == 0) & (u < _LINEAR_BELOW)
+        val = self.soften(flux, floor, pedestal)
+        # ``span`` is what ``soften - pedestal`` is proportional to as
+        # ``u -> -inf``; ``sigmoid`` decays like ``e^u`` just as ``softplus``
+        # does, so the restoration term adds to the coefficient.
+        span = s + (floor - pedestal) if self.restore_bright_end else s
+        limit = u + xp.log(xp.asarray(span))
+        # The pedestal, not the floor, decides this: it is what the output
+        # cannot go below, so it is what stops the log underflowing.
+        degenerate = (xp.asarray(pedestal) == 0) & (u < _LINEAR_BELOW)
         direct = (val > 0) & ~degenerate
         return xp.where(direct, xp.log(xp.where(direct, val, 1.0)), limit)
 
@@ -93,7 +128,7 @@ class LogFluxTransform:
         """
         return _xp(x).exp(x)
 
-    def inverse_exact(self, x, floor=0.0):
+    def inverse_exact(self, x, floor=0.0, pedestal=None):
         """The true inverse of ``forward``: ``s * log(expm1(exp(x) / s))``.
 
         For recovering a measurement, negative sky included.  Agrees with
@@ -101,9 +136,13 @@ class LogFluxTransform:
         """
         xp = _xp(x)
         s = self.softening
-        zero_floor = xp.asarray(floor) == 0
+        if pedestal is None:
+            pedestal = floor
+        if self.restore_bright_end:
+            return self._inverse_restored(x, floor, pedestal)
+        zero_floor = xp.asarray(pedestal) == 0
         v = xp.where(zero_floor, xp.exp(x - math.log(s)),
-                     (xp.exp(xp.where(zero_floor, 0.0, x)) - floor) / s)
+                     (xp.exp(xp.where(zero_floor, 0.0, x)) - pedestal) / s)
         cx = xp.where(zero_floor, x - math.log(s),
                       xp.log(xp.where(v > 0, v, 1e-300)))
         # Three regimes.  Large v: expm1 would overflow and log(expm1(v)) == v.
@@ -115,13 +154,43 @@ class LogFluxTransform:
         direct = xp.log(xp.expm1(mid))
         return floor + s * xp.where(big, v, xp.where(small, cx, direct))
 
+    def _inverse_restored(self, x, floor, pedestal):
+        """``inverse_exact`` for the restored map, by Newton on the residual.
+
+        Solves ``s * softplus(t) + lift * sigmoid(t) == exp(x) - pedestal``
+        for ``t = (f - floor) / s``; there is no closed form.  Both starting
+        points are exact asymptotes of the residual, so four steps already
+        reach the forward map's own precision -- 20 is margin, not need.
+        """
+        xp = _xp(x)
+        s = self.softening
+        lift = floor - pedestal
+        span = s + lift
+        target = xp.exp(x) - pedestal
+        cx = xp.log(xp.where(target > 0, target, 1e-300) / span)
+        small = cx < _LINEAR_BELOW
+        start = xp.where(target > span, (target - lift) / s, cx)
+        t = xp.where(small, 0.0, start)
+        for _ in range(20):
+            z = _sigmoid(t, xp)
+            phi = s * _softplus(t, xp) + lift * z - target
+            dphi = s * z + lift * z * (1.0 - z)
+            t = t - phi / xp.where(dphi > 1e-300, dphi, 1e-300)
+        return floor + s * xp.where(small, cx, t)
+
     def jacobian(self, x):
         """``df/dx`` for the model map, which is simply ``f`` itself."""
         return self.inverse(x)
 
-    def sky_level_at(self, floor=0.0):
-        """Where zero flux lands in ``x``: ``log(floor + s * log 2)``."""
-        return _xp(floor).log(floor + self.softening * math.log(2.0))
+    def sky_level_at(self, floor=0.0, pedestal=None):
+        """Where zero flux lands in ``x``: ``log(soften(0))``.
+
+        Not ``log(floor + s * log 2)``, which is this only at ``floor = 0``
+        where ``softplus(0) = log 2``.  That expression was the unfloored one
+        with the floor added on and was 0.13 nats out at the trained scales.
+        """
+        xp = _xp(floor)
+        return xp.log(self.soften(xp.asarray(floor) * 0.0, floor, pedestal))
 
     @property
     def sky_level(self) -> float:
@@ -214,6 +283,12 @@ class Prior:
     step: int
     source: Path
     config: dict
+    #: What the soft floor bends over to, nJy; 0 when the set had no floor.
+    #: Carried rather than recomputed, so ``to_x`` and ``to_flux_exact`` use
+    #: exactly the number ``load_prior`` read off the config.  Last because it
+    #: is the only field with a default and a dataclass will not take one
+    #: before the rest; ``load_prior`` passes every field by keyword anyway.
+    pedestal: float = 0.0
 
     # -- what it is --------------------------------------------------------
 
@@ -221,8 +296,15 @@ class Prior:
     def is_energy(self) -> bool:
         """Whether ``energy`` is available -- i.e. whether the score is an exact
         gradient.  False for ``architecture="ncsnpp"``, which predicts the score
-        directly and defines no potential."""
-        return isinstance(self.model, NCSNppEnergy)
+        directly and defines no potential.
+
+        Against ``EnergyModel`` and not a list of classes, which is what the
+        training package's ``inference.Prior`` does and what keeps the two in
+        step.  It was ``isinstance(self.model, NCSNppEnergy)``, and
+        ``NCSNppEncoderEnergy`` is a sibling rather than a subclass of that,
+        so an encoder checkpoint produced a correct score and then refused to
+        give up its energy -- which is the one thing HMC needs."""
+        return isinstance(self.model, EnergyModel)
 
     @property
     def sigma_min(self) -> float:
@@ -240,7 +322,7 @@ class Prior:
 
     def to_x(self, flux):
         """nJy -> the model's space.  Takes no band."""
-        return self.transform.forward(flux)
+        return self.transform.forward(flux, pedestal=self.pedestal)
 
     def to_flux(self, x):
         """The model's space -> nJy: ``exp(x)``.  **What a forward model calls.**
@@ -252,7 +334,7 @@ class Prior:
 
     def to_flux_exact(self, x):
         """The true inverse of ``to_x``, negative sky included."""
-        return self.transform.inverse_exact(x)
+        return self.transform.inverse_exact(x, pedestal=self.pedestal)
 
     # -- what a sampler or an HMC needs ------------------------------------
 
@@ -285,7 +367,7 @@ class Prior:
                 f"{self.architecture!r}, which predicts the score directly and "
                 f"is not the gradient of anything -- there is no energy to "
                 f"return. It needs a checkpoint trained with architecture "
-                f"'ncsnpp_energy'."
+                f"'ncsnpp_energy' or 'ncsnpp_encoder'."
             )
         batched, shape = self._as_batch(x)
         e = _energy(self.model, batched, self._sigmas(sigma, len(batched)),
@@ -338,13 +420,54 @@ class Prior:
         ])
 
 
+def _floor_k(tr_cfg: dict) -> float:
+    """The sky floor in units of the pooled sky noise, 0 when there is none.
+
+    ``floor_sigma`` is one number for the whole set.  It used to be a per-stamp
+    draw from ``[floor_sigma_lo, floor_sigma_hi]``, and an older checkpoint
+    carries that pair instead; the midpoint is what the training package used
+    for the input offset then, so reading it that way is exact rather than a
+    guess at what the run did.
+    """
+    if "floor_sigma" in tr_cfg:
+        return float(tr_cfg["floor_sigma"] or 0.0)
+    lo = float(tr_cfg.get("floor_sigma_lo") or 0.0)
+    hi = float(tr_cfg.get("floor_sigma_hi") or 0.0)
+    return 0.5 * (lo + hi)
+
+
+def _pedestal_of(tr_cfg: dict) -> float:
+    """What the soft floor bends over to, nJy, or 0 when there is no floor.
+
+    **Absent means an older checkpoint**, written before the pedestal existed,
+    whose floor bent over to the floor itself.  Guessing either way would be a
+    silent change to what ``exp(x)`` means, so this refuses instead.
+    """
+    if _floor_k(tr_cfg) <= 0:
+        return 0.0
+    if "floor_pedestal" not in tr_cfg:
+        raise ValueError(
+            "this config has a sky floor but no transform.floor_pedestal, so "
+            "it was written before the floor and the pedestal were separated. "
+            "Its map bent over to the floor itself; add "
+            '"floor_pedestal": null to say so explicitly, or the value the '
+            "run used. Reading it either way without being told would change "
+            "what exp(x) means by about 6 nJy, silently."
+        )
+    got = tr_cfg["floor_pedestal"]
+    if got is None:
+        # Explicitly the old behaviour: pedestal == the per-stamp floor.
+        return None
+    return float(got)
+
+
 def _input_offset(tr_cfg: dict) -> float:
-    """The typical sky level in ``x``: ``log(c + s * log 2)``.
+    """The typical sky level in ``x``: ``log(soften(0))`` at the typical floor.
 
     Subtracted from the scene before the first layer so the zeros the
     convolutions pad with sit at the sky.  ``c`` is the *typical* sky floor --
-    the midpoint of the per-stamp draw times the pooled sky noise, which is
-    recovered as ``softening / softening_sigma`` rather than stored again.
+    ``floor_sigma`` times the pooled sky noise, which is recovered as
+    ``softening / softening_sigma`` rather than stored again.
 
     **This must match ``Config.input_offset`` in the training package exactly.**
     It is a static field on the module, so it is not restored by
@@ -358,13 +481,24 @@ def _input_offset(tr_cfg: dict) -> float:
     s = float(tr_cfg["softening"])
     if not s:
         return 0.0
-    lo = float(tr_cfg.get("floor_sigma_lo") or 0.0)
-    hi = float(tr_cfg.get("floor_sigma_hi") or 0.0)
+    k = _floor_k(tr_cfg)
     softening_sigma = float(tr_cfg.get("softening_sigma") or 0.0)
     c = 0.0
-    if hi > 0 and softening_sigma > 0:
-        c = 0.5 * (lo + hi) * (s / softening_sigma)
-    return math.log(c + s * math.log(2.0))
+    if k > 0 and softening_sigma > 0:
+        c = k * (s / softening_sigma)
+    pedestal = _pedestal_of(tr_cfg)
+    if pedestal is None:
+        pedestal = c
+    # log(soften(0)) = log(pedestal + s * softplus(-c/s)), plus the
+    # restoration term when it is on.  It read log(c + s * log 2) until the
+    # pedestal landed, which is this only at c = 0 and was 0.13 nats out at
+    # the trained scales.
+    u = -c / s
+    sp = math.log1p(math.exp(-abs(u))) + max(u, 0.0)
+    val = pedestal + s * sp
+    if tr_cfg.get("restore_bright_end"):
+        val = val + (c - pedestal) / (1.0 + math.exp(-u))
+    return math.log(val)
 
 
 def load_prior(directory, which: str = "ema") -> Prior:
@@ -383,12 +517,12 @@ def load_prior(directory, which: str = "ema") -> Prior:
     d = Path(directory)
     cfg = json.loads((d / "config.json").read_text())
     architecture = cfg.get("architecture", "energy")
-    if architecture not in ("ncsnpp", "ncsnpp_energy"):
+    if architecture not in ("ncsnpp", "ncsnpp_energy", "ncsnpp_encoder"):
         raise ValueError(
             f"{d} was trained with architecture {architecture!r}, which this "
-            f"loader does not carry -- it has the NCSN++ U-Net only, in the "
-            f"two forms 'ncsnpp' and 'ncsnpp_energy'. Load it with the full "
-            f"rubin_host_prior package instead."
+            f"loader does not carry -- it has the NCSN++ backbone only, as "
+            f"'ncsnpp', 'ncsnpp_energy' and 'ncsnpp_encoder'. Load it with "
+            f"the full rubin_host_prior package instead."
         )
 
     sde_cfg, tr_cfg, patch = cfg["sde"], cfg["transform"], cfg["patch"]
@@ -402,22 +536,35 @@ def load_prior(directory, which: str = "ema") -> Prior:
 
     net_cfg = NCSNppConfig.from_dict(cfg.get("ncsnpp", {}))
     net_cfg.check()
-    transform = LogFluxTransform(softening=float(tr_cfg["softening"]))
+    transform = LogFluxTransform(
+        softening=float(tr_cfg["softening"]),
+        restore_bright_end=bool(tr_cfg.get("restore_bright_end")),
+    )
     sde = VESDE(float(sde_cfg["sigma_min"]), float(sde_cfg["sigma_max"]),
                 float(sde_cfg.get("data_mean") or 0.0))
     input_offset = _input_offset(tr_cfg)
+    pedestal = _pedestal_of(tr_cfg)
+    if pedestal is None:
+        ss = float(tr_cfg.get("softening_sigma") or 0.0)
+        k = _floor_k(tr_cfg)
+        pedestal = k * (transform.softening / ss) if (k > 0 and ss) else 0.0
     common = dict(sigma_min=sde.sigma_min, sigma_max=sde.sigma_max,
                   input_offset=input_offset, key=jax.random.key(0))
     if architecture == "ncsnpp":
         skeleton = NCSNpp(net_cfg, **common)
     else:
+        # Both energies need data_std for the 'dae' prefactor, and both
+        # restore their sigma-offset bands from the checkpoint like any other
+        # array -- they are module fields, not metadata.
         if net_cfg.energy_form == "dae" and sde_cfg.get("data_std") is None:
             raise ValueError(
                 f"{d} uses the 'dae' energy, whose prefactor is "
                 f"(data_std^2 + sigma^2)/sigma^2, but its config has no "
                 f"sde.data_std."
             )
-        skeleton = NCSNppEnergy(
+        cls = (NCSNppEncoderEnergy if architecture == "ncsnpp_encoder"
+               else NCSNppEnergy)
+        skeleton = cls(
             net_cfg, data_std=float(sde_cfg.get("data_std") or 1.0), **common)
 
     name = {"ema": "ema.eqx", "model": "model.eqx"}[which]
@@ -428,6 +575,7 @@ def load_prior(directory, which: str = "ema") -> Prior:
     step = json.loads((d / "state.json").read_text())["step"]
     return Prior(
         model=model, sde=sde, transform=transform, architecture=architecture,
+        pedestal=float(pedestal),
         size=int(patch["out_size"]), pool_factor=int(patch["pool_factor"]),
         step=int(step), source=d, config=cfg,
     )

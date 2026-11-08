@@ -31,6 +31,7 @@ import numpy as np
 
 from . import _backend
 from ._backend import DTYPE
+from .build_prior import training_floor
 from .hmc import make_broadening_fn, make_chunk_runner, make_log_parts, make_log_variance_fn, make_sigma_fn, make_target, sampler_sde
 from .products import load_chain_state, num_saved_states, read_scene_history
 from .sampler import calibrate_prior_offset, parameter_blocks
@@ -52,7 +53,9 @@ def describe_init(nm):
     s = prior.transform.softening
     sde = prior.config["sde"]
     factor = nm.prior_scene_factor
-    out(f"prior: softening s = {s:g} nJy/prior px, sky pedestal log(s log 2) = {np.log(s * np.log(2)):.3f}, "
+    floor, pedestal, sky_njy = training_floor(prior)
+    out(f"prior: softening s = {s:g} nJy/prior px, training sky floor {floor:.3g}, pedestal {pedestal:.3g}: "
+        f"zero flux at {sky_njy:.3g} nJy/prior px = log I {np.log(sky_njy):.3f}, "
         f"data_mean = {sde.get('data_mean')}, data_std = {sde.get('data_std')}, sigma in [{sde['sigma_min']:.4g}, {sde['sigma_max']:.4g}]")
     out(f"units: 1 data unit = {nm.njy_per_count:.4g} nJy (ZP {nm.zeropoint:g}); scale = {nm.scene_scale0:.4g}; prior scene factor {factor:g}"
         + (f" (the prior's landmarks above are {np.log(factor):.3f} higher in log I than the scene units below)" if factor != 1 else ""))
@@ -92,8 +95,8 @@ def describe_init(nm):
         for k in sorted({0, 1, n // 2, n - 1}):
             if k < n:
                 out(f"  chain {c} saved state {k:2d} (t={float(trace['saved_t'][k]):.3f}) {_fmt(np.log(np.clip(scenes[k], 1e-30, None)))}")
-        frac_dark = float(np.mean(np.log(np.clip(scenes[-1], 1e-30, None)) < np.log(s * np.log(2)) - 3))
-        out(f"  chain {c}: fraction of final pixels more than 3 e-folds below the prior's sky pedestal: {frac_dark:.3%}")
+        frac_dark = float(np.mean(np.log(np.clip(scenes[-1], 1e-30, None)) < np.log(sky_njy / factor) - 3))
+        out(f"  chain {c}: fraction of final pixels more than 3 e-folds below the prior's sky level: {frac_dark:.3%}")
     return lines
 
 

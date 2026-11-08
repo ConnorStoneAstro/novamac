@@ -3,8 +3,34 @@ import types
 
 import astrophot as ap
 import jax.numpy as jnp
+import numpy as np
 
 from .host_prior import Prior, VESDE, load_prior
+
+
+def training_floor(prior):
+    """
+    (floor, pedestal, sky) in nJy per prior pixel: the typical per-stamp sky
+    floor the prior's training images were softened with (floor_sigma times
+    the pooled sky noise, which is softening / softening_sigma; the midpoint
+    of the per-stamp range for a checkpoint that drew one), the pedestal the
+    floor bends over to (the floor itself for a checkpoint from before the
+    two were separated) and where zero flux lands, soften(0, floor,
+    pedestal), i.e. exp(the net's input offset). A prior trained without a
+    floor gives (0, 0, s log 2). The initial scene goes through this map so
+    its sky sits where the prior's training skies did.
+    """
+    tr = dict(prior.config.get("transform", {}))
+    s = float(prior.transform.softening)
+    if "floor_sigma" in tr:
+        k = float(tr["floor_sigma"] or 0.0)
+    else:
+        k = 0.5 * (float(tr.get("floor_sigma_lo") or 0.0) + float(tr.get("floor_sigma_hi") or 0.0))
+    ss = float(tr.get("softening_sigma") or 0.0)
+    floor = k * s / ss if (k > 0 and ss > 0) else 0.0
+    pedestal = float(getattr(prior, "pedestal", floor)) if floor > 0 else 0.0
+    sky = float(prior.transform.soften(np.zeros(()), floor, pedestal))
+    return floor, pedestal, sky
 
 
 def build_prior(

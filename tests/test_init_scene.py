@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from novamac import Novamac, build_likelihood
+from novamac.build_prior import training_floor
+from novamac.host_prior import LogFluxTransform, load_prior
 from novamac.sampler import flat_data_weight
 from novamac.init_scene import (
     aperture_fluxes,
@@ -144,11 +146,25 @@ def test_fill_uncovered_on_a_stack(rotated_images):
 
 def test_prior_transform():
     scene = np.array([[-5.0, 0.0, 1000.0]])
-    out, n_neg = prior_transform(scene, scene_scale=2.0, softening=10.0)
+    out, n_neg = prior_transform(scene, scene_scale=2.0, transform=LogFluxTransform(softening=10.0))
     assert n_neg == 1
     assert np.all(out > 0)
-    assert np.isclose(out[0, 1], 2.0 * 10.0 * np.log(2))  # zero flux lands on the pedestal s log 2
+    assert np.isclose(out[0, 1], 2.0 * 10.0 * np.log(2))  # without a floor zero flux lands on s log 2
     assert np.isclose(out[0, 2], 1000.0, rtol=1e-6)  # bright pixels untouched
+    # with the training floor and pedestal of a floored prior: the sky lands on
+    # the pedestal, bright pixels are exact again (restore_bright_end)
+    tr = LogFluxTransform(softening=0.8, restore_bright_end=True)
+    out, _ = prior_transform(scene, scene_scale=2.0, transform=tr, floor=13.0, pedestal=0.1)
+    assert np.isclose(out[0, 1], 2.0 * 0.1, rtol=1e-4) and out[0, 0] > 0
+    assert np.isclose(out[0, 2], 1000.0, rtol=1e-6)
+
+
+def test_training_floor_of_a_prior_without_a_floor(prior_dir):
+    prior = load_prior(prior_dir)
+    floor, pedestal, sky = training_floor(prior)
+    assert floor == 0 and pedestal == 0
+    assert np.isclose(sky, prior.transform.softening * np.log(2))
+    assert np.isclose(np.log(sky), prior.model.net.input_offset)  # the net's sky offset is this level
 
 
 def test_stack_roundtrip_through_forward_model():
@@ -260,7 +276,7 @@ def test_novamac_estimates_initial_values(tmp_path, prior_dir, synthetic):
     host_in_border = nm.sky.mean() - truth["sky"] / area  # the border level minus the true residual sky
     # per pixel the stack of 5 noisy templates scatters by ~30% here, so compare the mean
     assert abs(np.mean((raw + host_in_border)[bright]) / np.mean(truth["scene"][bright]) - 1) < 0.15
-    pedestal = nm.prior.transform.softening * np.log(2) * nm.scene_scale0  # where zero flux lands
+    pedestal = training_floor(nm.prior)[2] * nm.scene_scale0  # where zero flux lands
     assert np.all(scene > 0.5 * pedestal) and np.any(np.isclose(scene, pedestal, rtol=0.05))
     assert "drizzled" in nm.init_info["report"][0]
     assert len(nm.geometry_report()) == 5

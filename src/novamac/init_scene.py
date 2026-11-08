@@ -33,12 +33,12 @@ So the init has to be a clean estimate of the static scene:
      create them). The noise is measured from the stack itself (robust
      scatter of its faint pixels, clipped), not from the variance maps, and
      scaled per pixel by the coverage.
-  3. prior_transform: the scene goes through the prior's own flux transform,
-     s * softplus(f / s) with f in the prior's units, exactly as the prior's
-     training images did: bright pixels are untouched, the sky lands on the
-     prior's pedestal s * log 2 and negative sky pixels compress smoothly
-     toward zero instead of becoming deep pits in log I that the prior has
-     never seen.
+  3. prior_transform: the scene goes through the prior's own flux transform
+     with the sky floor and pedestal its training images were softened with
+     (build_prior.training_floor): bright pixels are untouched, pixels below
+     the floor land on the prior's pedestal (s * log 2 for a prior trained
+     without a floor) and negative sky pixels compress smoothly toward it
+     instead of becoming deep pits in log I that the prior has never seen.
 
 Conventions (AstroPhot, established empirically by rendering a single bright
 scene pixel through novamac's forward model while moving the model centre,
@@ -245,19 +245,25 @@ def covered_edge(uncovered):
     return near & ~u
 
 
-def prior_transform(scene, scene_scale, softening, prior_scene_factor=1.0):
+def prior_transform(scene, scene_scale, transform, floor=0.0, pedestal=None, prior_scene_factor=1.0):
     """
     The scene (data units per arcsec^2) through the prior's flux transform,
-    s * softplus(f / s) with f = scene / scene_scale * prior_scene_factor in
-    the prior's units (nJy per prior pixel, times the factor the prior is
-    shown), back in the scene's units. Returns (softened scene, number of
-    negative input pixels).
+    transform.soften(f, floor, pedestal) with f = scene / scene_scale *
+    prior_scene_factor in the prior's units (nJy per prior pixel, times the
+    factor the prior is shown) and the floor and pedestal its training
+    images were softened with (build_prior.training_floor; pedestal None =
+    the floor), back in the scene's units. Returns (softened scene, number
+    of negative input pixels).
     """
+    if pedestal is None:
+        pedestal = floor
     f_prior = np.asarray(scene, dtype=float) / scene_scale * prior_scene_factor
-    softened = softening * np.logaddexp(0.0, f_prior / softening) / prior_scene_factor
-    # softplus underflows to exactly 0 for f / s < -745, and log(0) = -inf would
-    # poison the start: floor at a negligible fraction of the pedestal
-    softened = np.maximum(softened, 1e-12 * softening * np.log(2.0) / prior_scene_factor)
+    softened = np.asarray(transform.soften(f_prior, floor, pedestal), dtype=float) / prior_scene_factor
+    # without a pedestal softplus underflows to exactly 0 for f / s < -745, and
+    # log(0) = -inf would poison the start: floor at a negligible fraction of
+    # the sky level
+    sky = float(transform.soften(np.zeros(()), floor, pedestal))
+    softened = np.maximum(softened, 1e-12 * sky / prior_scene_factor)
     return softened * scene_scale, int(np.sum(f_prior < 0))
 
 
@@ -417,7 +423,7 @@ def difference_fluxes(data, weight, mask, is_template, crpix, crtan, CD, stack, 
 
 
 def prepare_initial_scene(data, weight, mask, is_template, crpix, crtan, CD, scene_shape, pix_scale, center, *,
-                          scene_scale, softening, prior_scene_factor=1.0, init_image=None, sky=None,
+                          scene_scale, transform, floor=0.0, pedestal=None, prior_scene_factor=1.0, init_image=None, sky=None,
                           threshold_sigma=3.0, fill_sigma=0.0, min_templates=4, subsample=5):
     """
     The sampler's initial scene: `init_image` (data units per arcsec^2 on
@@ -465,11 +471,14 @@ def prepare_initial_scene(data, weight, mask, is_template, crpix, crtan, CD, sce
             f"{n_iter} iterations): their median is {np.median(scene[uncovered]):.3g} data units/arcsec^2, "
             f"the covered edge's median {np.median(scene[covered_edge(uncovered)]):.3g}"
         )
-    scene, n_neg = prior_transform(scene, scene_scale, softening, prior_scene_factor)
-    pedestal = softening * np.log(2.0)
+    if pedestal is None:
+        pedestal = floor
+    scene, n_neg = prior_transform(scene, scene_scale, transform, floor, pedestal, prior_scene_factor)
+    sky_level = float(transform.soften(np.zeros(()), floor, pedestal))
     report.append(
-        f"initial scene through the prior's transform (softening {softening:g} nJy/prior px, pedestal {pedestal:.3g}"
-        + (f", prior scene factor {prior_scene_factor:g}: pedestal {pedestal / prior_scene_factor:.3g} in scene units" if prior_scene_factor != 1 else "")
+        f"initial scene through the prior's transform (softening {transform.softening:g} nJy/prior px, training sky floor "
+        f"{floor:.3g}, pedestal {pedestal:.3g}: zero flux lands at {sky_level:.3g} nJy/prior px, log I {np.log(sky_level):.2f}"
+        + (f", prior scene factor {prior_scene_factor:g}: {sky_level / prior_scene_factor:.3g} in scene units" if prior_scene_factor != 1 else "")
         + f"): {n_neg} of {scene.size} pixels were negative; log I now in [{np.log(scene.min() / scene_scale):.2f}, {np.log(scene.max() / scene_scale):.2f}]"
     )
     return scene, {"count": count, "raw": raw, "noise": noise, "report": report}
