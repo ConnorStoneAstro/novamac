@@ -173,8 +173,19 @@ def calibrate_prior_offset(model, scene_log, rng_key, n_sigmas=64):
     Install model.meta.prior_energy_offset: the mean per-pixel energy of the
     initial scene noised to sigma, E(scene_log + sigma z, sigma) / N, on a
     log-spaced grid of `n_sigmas` sigma over the prior's range, interpolated
-    in log sigma. Must run before log_prior is first traced. Returns
-    (sigmas, values).
+    in log sigma, divided by the prior's offset multiplicity. Must run before
+    log_prior is first traced. Returns (sigmas, values), the values being
+    what is passed as the prior's pixel_offset.
+
+    The multiplicity: how many times the prior takes `pixel_offset` off per
+    pixel, measured as (E(x, sigma, 0) - E(x, sigma, 1)) / N. 1 for the
+    ncsnpp_energy prior (one map, one subtraction per pixel); the
+    ncsnpp_encoder prior subtracts it on every level of its pyramid, area
+    weighted, so the offset comes off once per level and the total is
+    levels x N x pixel_offset. Passing the per-pixel energy there left a
+    total of (levels - 1) x N x E/N ~ 5e7 in float32 (spacing ~4 nats), the
+    Metropolis test was quantised to noise and the step sizes collapsed.
+    model.meta.prior_offset_multiplicity records it.
     """
     prior = model.meta.host_prior
     sde = sampler_sde(model)
@@ -184,6 +195,13 @@ def calibrate_prior_offset(model, scene_log, rng_key, n_sigmas=64):
     n_pix = scene.size
     z = jax.random.normal(rng_key, scene.shape, DTYPE)
     values = np.array([float(prior.energy(scene + float(sg) * z, float(sg))) / n_pix for sg in sigmas])
+    s0 = float(sigmas[0])
+    mult = (float(prior.energy(scene + s0 * z, s0, 0.0)) - float(prior.energy(scene + s0 * z, s0, 1.0))) / n_pix
+    if not np.isfinite(mult) or abs(mult - round(mult)) > 1e-3 or mult < 1:
+        raise RuntimeError(f"the prior's pixel_offset multiplicity measured as {mult:.6g}, not a positive integer")
+    mult = float(round(mult))
+    model.meta.prior_offset_multiplicity = mult
+    values = values / mult
     log_sig = jnp.asarray(np.log(sigmas), DTYPE)
     if np.all(values > 0) or np.all(values < 0):
         # the "dae" level is ~ (s^2 + sigma^2) / sigma^2, a power law at small

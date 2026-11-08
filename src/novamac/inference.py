@@ -1070,9 +1070,12 @@ class Novamac:
                     model, scene_log, key_off, self.prior_offset_sigmas
                 )
             sg, val = prior_offset_table
+            mult = float(model.meta.prior_offset_multiplicity)
             log(
-                f"prior energy offset per pixel: {val[0]:.4g} at sigma={sg[0]:.3g} ... {val[-1]:.4g} at sigma={sg[-1]:.3g} "
-                f"(x{len(scene_idx)} pixels; subtracted inside the prior's sum so the logged log prior is relative to a typical noised scene)"
+                f"prior energy offset per pixel: {val[0] * mult:.4g} at sigma={sg[0]:.3g} ... {val[-1] * mult:.4g} at sigma={sg[-1]:.3g} "
+                f"(x{len(scene_idx)} pixels; subtracted inside the prior's sum so the logged log prior is relative to a typical noised scene"
+                + (f"; the prior takes its pixel_offset off {mult:g} times per pixel, so it is passed 1/{mult:g} of this" if mult != 1 else "")
+                + ")"
             )
         scene_mask = np.zeros(dim)
         scene_mask[scene_idx] = 1.0
