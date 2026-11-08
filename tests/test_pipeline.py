@@ -8,6 +8,8 @@ couple of minutes on a CPU (jit compiles dominate); the prior-only and
 frozen test modes are marked slow.
 """
 
+import caskade as ck
+import h5py
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -15,7 +17,7 @@ import pytest
 from conftest import FAST_SETTINGS
 from novamac import Novamac
 from novamac._backend import DTYPE
-from novamac.products import RunFiles, collect_fluxes
+from novamac.products import RunFiles, collect_fluxes, load_chain_state, num_saved_states, read_param_history, read_scene_history
 
 FIGURES = (
     "sample_progress", "sample_scene", "sample_tweedie", "sample_fluxes", "sample_flux_trace",
@@ -28,12 +30,42 @@ def _check_run(nm, trace):
     s = FAST_SETTINGS
     assert int(trace["steps_done"]) == s["warmup_steps"] + s["anneal_steps"] + s["hold_steps"]
     assert np.all(np.isfinite(trace["logdensity"]))
-    assert nm.files.tweedie.exists() and nm.files.timings.exists()
-    for c in range(s["num_chains"]):
-        assert nm.files.chain(c).exists()
+    assert nm.files.tweedie.exists() and nm.files.timings.exists() and nm.files.chains.exists()
     fluxes = collect_fluxes(nm.files, s["num_chains"])
     assert fluxes.shape[0] == s["num_chains"] and fluxes.shape[1] == len(trace["saved_step"])
     assert np.all(np.isfinite(fluxes))
+    _check_chain_files(nm, trace)
+
+
+def _check_chain_files(nm, trace):
+    """The chain file holds every saved state of every chain, the chains as
+    the batch axis of the sampled parameters; a chain's state loads into a
+    single-state model; the sampler leaves the model single-state."""
+    s = FAST_SETTINGS
+    C, n_saved = s["num_chains"], len(trace["saved_step"])
+    model = nm.build_model()
+    with ck.ValidContext(model):
+        x, group1 = model.get_values()
+    assert np.shape(x) == (int(trace["dim"]),) if "dim" in trace else np.ndim(x) == 1, "the model is single-state after sample()"
+    with h5py.File(nm.files.chains, "r") as h5:
+        assert num_saved_states(h5) == n_saved
+        scenes = read_scene_history(h5)
+        assert scenes.shape[:2] == (n_saved, C) and np.all(np.isfinite(scenes))
+        assert not np.allclose(scenes[-1, 0], scenes[-1, 1]), "chains differ"
+        flux = read_param_history(h5, "ps_batch_model_0/model/flux/value", C)
+        assert flux.shape[:2] == (n_saved, C)
+        # a static parameter is repeated over the chain axis on request
+        ind = read_param_history(h5, "template_indicator/value")
+        assert ind.shape == (n_saved, nm.n_images)
+        assert read_param_history(h5, "template_indicator/value", C).shape == (n_saved, C, nm.n_images)
+        # a chain's saved state loads into a single-state model with those values
+        load_chain_state(model, h5, -1, 1)
+        np.testing.assert_allclose(np.asarray(model.models.pixelated_batch_model.model.I.value), scenes[-1, 1], rtol=1e-6)
+        np.testing.assert_allclose(np.asarray(model.models.ps_batch_model_0.model.flux.value), flux[-1, 1], rtol=1e-6)
+    with ck.ValidContext(model):
+        x1, _ = model.get_values()
+        model.set_values((jnp.asarray(x1, DTYPE), jnp.asarray(group1, DTYPE)))  # a flat single-state set_values still works
+    assert np.ndim(x1) == 1
 
 
 def test_posterior_run_plots_and_diagnostics(tmp_path, prior_dir, synthetic):

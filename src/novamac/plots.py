@@ -314,16 +314,19 @@ def plot_parameter_traces(nm, trace=None):
     crtan0 = nm.crtan
     data_pix = nm.data_pixel_scale
     P = nm.n_sources
-    align, centre, sky, scale, psf = [], [], [], [], {k: [] for k in ("n", "Rd", "q", "PA")}
-    for c in range(n_chains):
-        with h5py.File(nm.files.chain(c), "r") as h5:
-            crtan = np.stack([read_param_history(h5, f"images/{name}/crtan/value") for name in names], axis=1)  # (saved, N, 2)
-            align.append(crtan - crtan0[None])
-            centre.append(np.concatenate([read_param_history(h5, f"ps_batch_model_{p}/model/center/value") for p in range(P)], axis=1))
-            sky.append(read_param_history(h5, "sky_batch_model/model/I0/value"))
-            scale.append(read_param_history(h5, "pixelated_batch_model/model/scale/value")[:, None])
-            for k in psf:
-                psf[k].append(read_param_history(h5, f"_psf/{k}/value"))
+    with h5py.File(nm.files.chains, "r") as h5:
+        rp = lambda suffix: read_param_history(h5, suffix, n_chains)  # (saved, chains, ...)  # noqa: E731
+        crtan = np.stack([rp(f"images/{name}/crtan/value") for name in names], axis=2)  # (saved, chains, N, 2)
+        centre_all = np.concatenate([rp(f"ps_batch_model_{p}/model/center/value") for p in range(P)], axis=2)
+        sky_all = rp("sky_batch_model/model/I0/value")
+        scale_all = rp("pixelated_batch_model/model/scale/value")[:, :, None]
+        psf_all = {k: rp(f"_psf/{k}/value") for k in ("n", "Rd", "q", "PA")}
+    # per chain, as the trace panels take them
+    align = [crtan[:, c] - crtan0[None] for c in range(n_chains)]
+    centre = [centre_all[:, c] for c in range(n_chains)]
+    sky = [sky_all[:, c] for c in range(n_chains)]
+    scale = [scale_all[:, c] for c in range(n_chains)]
+    psf = {k: [v[:, c] for c in range(n_chains)] for k, v in psf_all.items()}
     saved_step = trace["saved_step"]
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
@@ -417,15 +420,12 @@ def _scene_states(nm, trace, max_panels):
     Tweedie figures."""
     n_chains = int(trace["num_chains"])
     P = nm.n_sources
-    scenes, scales, centres = [], [], []
-    for c in range(n_chains):
-        with h5py.File(nm.files.chain(c), "r") as h5:
-            scenes.append(read_scene_history(h5))
-            scales.append(read_param_history(h5, "pixelated_batch_model/model/scale/value"))
-            centres.append(np.stack([read_param_history(h5, f"ps_batch_model_{p}/model/center/value") for p in range(P)], axis=1))
-    n_saved = min(sc.shape[0] for sc in scenes)
-    scenes = np.stack([sc[:n_saved] for sc in scenes])  # (chains, saved, H, W)
-    marks = scene_pixel_marks(nm, np.stack([ce[:n_saved] for ce in centres]), scenes.shape[-2:])  # (chains, saved, P, 2)
+    with h5py.File(nm.files.chains, "r") as h5:
+        scenes = np.transpose(read_scene_history(h5), (1, 0, 2, 3))  # (chains, saved, H, W)
+        scales = read_param_history(h5, "pixelated_batch_model/model/scale/value", n_chains).T  # (chains, saved)
+        centres = np.stack([read_param_history(h5, f"ps_batch_model_{p}/model/center/value", n_chains) for p in range(P)], axis=2)
+    n_saved = scenes.shape[1]
+    marks = scene_pixel_marks(nm, np.transpose(centres, (1, 0, 2, 3)), scenes.shape[-2:])  # (chains, saved, P, 2)
     pick = _pick_states(n_saved, max_panels)
     reference = trace["pflow_reference"] if "pflow_reference" in trace else None  # prior-only runs
     # common log colour scale from the final states (and the reference), so
@@ -481,10 +481,10 @@ def plot_tweedie(nm, trace=None, max_panels=16):
         pix = model.models.pixelated_batch_model.model
         scene_idx = jnp.asarray(block_indices(model, [pix.I]))
         images = np.full((n_chains, int(max(pick)) + 1) + tuple(pix.I.shape), np.nan)
-        for c in range(n_chains):
-            with h5py.File(nm.files.chain(c), "r") as h5:
+        with h5py.File(nm.files.chains, "r") as h5:
+            for c in range(n_chains):
                 for k in pick:
-                    load_chain_state(model, h5, int(k))
+                    load_chain_state(model, h5, int(k), c)
                     with ck.ValidContext(model):
                         x, _ = model.get_values()
                     x = jnp.asarray(x, DTYPE)
@@ -563,8 +563,8 @@ def plot_fit_state(nm, chain=0, index=-1):
     """Light curve, alignment shifts, host images, residual histogram and the
     target / model / residual image grids at saved state `index` of `chain`."""
     model = nm.build_model()
-    with h5py.File(nm.files.chain(chain), "r") as h5:
-        load_chain_state(model, h5, index)
+    with h5py.File(nm.files.chains, "r") as h5:
+        load_chain_state(model, h5, index, chain)
     files = nm.files
     is_template = nm.is_template
     x = np.arange(nm.n_images) if nm.mjd is None else nm.mjd

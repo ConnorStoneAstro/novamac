@@ -1261,11 +1261,9 @@ class Novamac:
         if not all(np.isfinite(v) for pair in checks.values() for v in pair):
             raise RuntimeError(f"{self.name}: non-finite log density at the starting point")
 
-        # Prepare outputs (clean start, stale chain files removed)
+        # Prepare outputs (clean start, a stale chain file removed)
         # ----------------------------------------------------------------
-        chain_paths = [files.chain(c) for c in range(C)]
-        for p in chain_paths:
-            p.unlink(missing_ok=True)
+        files.chains.unlink(missing_ok=True)
         tpath = files.trace
 
         ts, plateau_starts = build_schedule(
@@ -1524,7 +1522,10 @@ class Novamac:
             np.savez(files.tweedie, scene_hat=np.stack(scene_hat), saved_step=np.array(trace["saved_step"]),
                      saved_t=np.array(trace["saved_t"]))  # fmt: skip
 
-        save_chain_states(model, positions, group1, chain_paths)
+        # Each save appends every chain's state to the chain file in one go,
+        # the chains as caskade's batch axis (one set_values and one append
+        # per save; chain by chain it cost as much as the sampling)
+        save_chain_states(model, positions, group1, files.chains)
         trace["saved_step"].append(0)
         trace["saved_t"].append(ts[0])
         write_trace(tpath, trace)
@@ -1794,7 +1795,7 @@ class Novamac:
             # Save model states
             if s1 % self.save_every == 0 or s1 == total:
                 with Timer("save state", timings, quiet=True):
-                    save_chain_states(model, positions, group1, chain_paths)
+                    save_chain_states(model, positions, group1, files.chains)
                     trace["saved_step"].append(s1)
                     trace["saved_t"].append(ts[s1 - 1])
                     write_trace(tpath, trace)

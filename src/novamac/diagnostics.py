@@ -88,10 +88,11 @@ def describe_init(nm):
         for c in range(ref.shape[0]):
             out(f"  pflow reference chain {c}       {_fmt(np.log(np.clip(ref[c], 1e-30, None)))}")
     C = int(trace["num_chains"])
+    with h5py.File(nm.files.chains, "r") as h5:
+        n = num_saved_states(h5)
+        all_scenes = read_scene_history(h5)  # (saved, chains, H, W)
     for c in range(C):
-        with h5py.File(nm.files.chain(c), "r") as h5:
-            n = num_saved_states(h5)
-            scenes = read_scene_history(h5)
+        scenes = all_scenes[:, c]
         for k in sorted({0, 1, n // 2, n - 1}):
             if k < n:
                 out(f"  chain {c} saved state {k:2d} (t={float(trace['saved_t'][k]):.3f}) {_fmt(np.log(np.clip(scenes[k], 1e-30, None)))}")
@@ -160,12 +161,12 @@ def diagnose_stall(nm, n_last=4):
                          float(data_std) if jacobian_sigma is None else jacobian_sigma)  # fmt: skip
     out(f"target: tweedie {tweedie}, mean correction {log_var_fn is not None}, likelihood {settings.get('likelihood', True)}")
     finals = []
-    for c in range(C):
-        with h5py.File(nm.files.chain(c), "r") as h5:
-            load_chain_state(model, h5, -1)
-        with ck.ValidContext(model):
-            x, _ = model.get_values()
-        finals.append(jnp.asarray(x, DTYPE))
+    with h5py.File(nm.files.chains, "r") as h5:
+        for c in range(C):
+            load_chain_state(model, h5, -1, c)
+            with ck.ValidContext(model):
+                x, _ = model.get_values()
+            finals.append(jnp.asarray(x, DTYPE))
     x = finals[0]
     scene = jnp.asarray(trace["scene_idx"])
     acc_per_chunk = np.array([np.nanmean(trace["accept_prob"][int(e) - int(trace["chunk_steps"]) : int(e)]) for e in trace["chunk_step"][:n_chunks]])

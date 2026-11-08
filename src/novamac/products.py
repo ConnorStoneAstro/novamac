@@ -46,8 +46,11 @@ class RunFiles:
     def path(self, suffix: str) -> Path:
         return self.out_dir / f"{self.name}_{suffix}"
 
-    def chain(self, c: int) -> Path:
-        return self.path(f"chain{c}.h5")
+    @property
+    def chains(self) -> Path:
+        """The caskade chain file: every saved state of every chain, the chains
+        as the batch axis of each sampled parameter (sampler.save_chain_states)."""
+        return self.path("chains.h5")
 
     @property
     def trace(self) -> Path:
@@ -83,7 +86,7 @@ class RunFiles:
 # Chain file helpers
 #####################################################################
 def num_saved_states(h5file) -> int:
-    """Number of states appended to an open chain file (h5py.File). Every
+    """Number of states appended to the open chain file (h5py.File). Every
     param dataset has the same leading sample axis, so read it off the first
     appendable one found."""
     found = []
@@ -99,61 +102,89 @@ def num_saved_states(h5file) -> int:
     return found[0]
 
 
-def load_chain_state(model, h5file, index: int):
-    """Set the model parameters to saved state `index` of an open chain file
-    (an h5py.File). Negative indices count from the end."""
+def load_chain_state(model, h5file, index: int, chain: int):
+    """Set the model parameters to saved state `index` of chain `chain` from
+    the open chain file (an h5py.File). Negative indices count from the end.
+    caskade loads the state with the chains as the batch axis of every
+    sampled parameter; the chain's values are then selected so the model is
+    an ordinary single-state model again."""
     # caskade restores the valid range one bound at a time, which raises a
     # spurious "outside the valid range" warning for cyclic params like PA
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", InvalidValueWarning)
         model.load_state(h5file, index=index)
+    n_chains = chain_axis_length(h5file)
+    for p in model.dynamic_params:
+        v = p.value
+        if v is not None and v.ndim >= 1 and v.shape[0] == n_chains and not (p.group == 1):
+            p.value = v[chain]
 
 
-def read_param_history(h5, suffix):
+def chain_axis_length(h5) -> int:
+    """The number of chains in the chain file: the batch axis of the scene."""
+    found = []
+
+    def visit(name, obj):
+        if name.endswith("pixelated_batch_model/model/I/value") and isinstance(obj, h5py.Dataset):
+            found.append(obj.shape[1])
+            return True
+
+    h5.visititems(visit)
+    if not found:
+        raise ValueError(f"{h5.filename}: no scene dataset")
+    return found[0]
+
+
+def read_param_history(h5, suffix, n_chains=None):
     """All saved states of one parameter, read straight from the chain file:
     the dataset whose path ends with `suffix` (e.g. "ps_batch_model_0/model/
     flux/value"). caskade stores appendable values with the sample index as
-    the leading axis, so the result has shape (n_saved, *param_shape)."""
+    the leading axis and the sampler sets the chains as the batch axis of the
+    sampled parameters, so a sampled parameter comes back as (n_saved,
+    n_chains, *param_shape) and a static one as (n_saved, *param_shape); with
+    `n_chains` given a static parameter is repeated over a chain axis so
+    every result has the chain axis."""
     found = []
 
     def visit(name, obj):
         if name.endswith(suffix) and isinstance(obj, h5py.Dataset):
-            found.append(obj[()])
+            found.append((obj[()], str(obj.attrs.get("node_type", ""))))
             return True
 
     h5.visititems(visit)
     if not found:
         raise ValueError(f"{h5.filename}: no dataset ending in {suffix}")
-    return np.asarray(found[0])
+    value, node_type = found[0]
+    value = np.asarray(value)
+    if n_chains is not None and ("static" in node_type or value.ndim < 2 or value.shape[1] != n_chains):
+        value = np.broadcast_to(value[:, None], (value.shape[0], n_chains) + value.shape[1:])
+    return value
 
 
 def read_scene_history(h5):
-    """All saved states of the pixelated scene (n_saved, H, W), physical flux
-    (the prior's units; the model renders scale x I)."""
+    """All saved states of the pixelated scene (n_saved, n_chains, H, W),
+    physical flux (the prior's units; the model renders scale x I)."""
     return read_param_history(h5, "pixelated_batch_model/model/I/value")
 
 
-def collect_fluxes(files: RunFiles, n_chains: int):
+def collect_fluxes(files: RunFiles, n_chains: int = None):
     """
     Point-source fluxes at every saved state of every chain, read from the
-    chain files without building the model: (chains, saved, P, N). The flux
+    chain file without building the model: (chains, saved, P, N). The flux
     is a pointer parameter (allflux x template indicator) and caskade saved
     its evaluated value, so it is already zero on template images.
     """
-    fluxes = []
-    for c in range(n_chains):
-        with h5py.File(files.chain(c), "r") as h5:
-            per_ps = []
-            p = 0
-            while True:
-                try:
-                    per_ps.append(read_param_history(h5, f"ps_batch_model_{p}/model/flux/value"))
-                except ValueError:
-                    break
-                p += 1
-            fluxes.append(np.stack(per_ps, axis=1))  # (saved, P, N)
-    n_saved = min(f.shape[0] for f in fluxes)  # chains can differ by one if the job died mid-save
-    return np.stack([f[:n_saved] for f in fluxes])
+    with h5py.File(files.chains, "r") as h5:
+        n_chains = chain_axis_length(h5) if n_chains is None else n_chains
+        per_ps = []
+        p = 0
+        while True:
+            try:
+                per_ps.append(read_param_history(h5, f"ps_batch_model_{p}/model/flux/value", n_chains))
+            except ValueError:
+                break
+            p += 1
+    return np.transpose(np.stack(per_ps, axis=2), (1, 0, 2, 3))  # (saved, chains, P, N) -> (chains, saved, P, N)
 
 
 def draw_states(trace):

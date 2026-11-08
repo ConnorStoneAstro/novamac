@@ -398,17 +398,39 @@ def find_initial_step_size(runner_1step, rng, positions, inv_mass0, t, jj, t_rel
 
 # Disk output helpers
 #####################################################################
-def save_chain_states(model, positions, group1, paths):
-    """Append the current position of every chain to its caskade chain file
-    (creating it on first use). Positions are unconstrained; set_values inside
-    the ValidContext maps them to physical values, which is what is stored."""
+def save_chain_states(model, positions, group1, path):
+    """Append the current state of every chain to the run's chain file,
+    creating it on first use. The chains are caskade's batch axis: the
+    positions (chains, dim) are set on the model in one batched set_values
+    (the valid-range mapping runs once per parameter for all chains), and
+    one save_state / append_state writes every parameter once, so the file
+    holds each sampled parameter as (saved, chains, *shape) and each static
+    parameter as (saved, *shape). The single-state values are put back
+    afterwards (restore_values): caskade sizes the parameters of its forward
+    calls from the stored values, so a chain-batched model would break the
+    next kernel the sampler compiles."""
+    single_state = snapshot_values(model)
     with ck.ValidContext(model):
-        for pos, path in zip(positions, paths):
-            model.set_values((pos, group1))
-            if path.exists():
-                model.append_state(str(path))
-            else:
-                model.save_state(str(path), appendable=True)
+        model.set_values((positions, group1))
+    if path.exists():
+        model.append_state(str(path))
+    else:
+        model.save_state(str(path), appendable=True)
+    restore_values(model, single_state)
+
+
+def snapshot_values(model):
+    """The stored value of every dynamic parameter, per group (restore_values)."""
+    return [[p.value for p in model.dynamic_params if p.group == g] for g in model.dynamic_param_groups]
+
+
+def restore_values(model, values):
+    """Put the values of snapshot_values back, parameter by parameter (outside
+    a ValidContext, so they are assigned as they are). Needed after a
+    chain-batched set_values: caskade infers a parameter's batch shape from
+    its stored value, so a flat single-state set_values would be sized
+    wrongly until the single-state values are back."""
+    model.set_values(values if len(values) > 1 else values[0])
 
 
 def write_trace(path, trace):
