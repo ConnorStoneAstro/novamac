@@ -1393,13 +1393,20 @@ class Novamac:
             noised = positions[:, scene_dev_idx] + s0 * jax.random.normal(
                 key_start, (C, len(scene_idx)), DTYPE
             )
+            n_clipped = int(jnp.sum(jnp.abs(noised) > self.max_abs_log_scene))
             positions = positions.at[:, scene_dev_idx].set(
                 jnp.clip(noised, -self.max_abs_log_scene, self.max_abs_log_scene)
             )
-            ll = float(log_lik(positions[0], broaden_fn(t_start) * jj))
-            lp = float(log_prior(positions[0], t_start))
+            # the likelihood the chains see at t_start: through the target's
+            # Tweedie map (the raw likelihood of the noised scene overflows
+            # exp() once pixels sit on the box, which the target never
+            # evaluates for t > 0)
+            start_target = target if self._likelihood_on(0, t_start) else target_off
+            ll, lp = (float(v) for v in start_target.parts(positions[0], t_start, broaden_fn(t_start) * jj)[:2])
             log(
-                f"scene start = initial scene + N(0, {s0:.3g}^2) in log I per chain; chain 0 at t={t_start:.3g}: log likelihood {ll:.6g}, log prior {lp:.6g}"
+                f"scene start = initial scene + N(0, {s0:.3g}^2) in log I per chain"
+                + (f" ({n_clipped} of {C * len(scene_idx)} pixels clipped to |log I| <= {self.max_abs_log_scene:g})" if n_clipped else "")
+                + f"; chain 0 at t={t_start:.3g}: log likelihood {ll:.6g}, log prior {lp:.6g}"
             )
             if not (np.isfinite(ll) and np.isfinite(lp)):
                 raise RuntimeError(
