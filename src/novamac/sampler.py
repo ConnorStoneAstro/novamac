@@ -8,6 +8,8 @@ itself is described in hmc.py; the loop that runs it is Novamac.sample.
 
 import os
 
+import inspect
+
 import caskade as ck
 import jax
 import jax.numpy as jnp
@@ -415,7 +417,12 @@ def save_chain_states(model, positions, group1, path):
     if path.exists():
         model.append_state(str(path))
     else:
-        model.save_state(str(path), appendable=True)
+        if "compression" in inspect.signature(model.save_state).parameters:
+            # uncompressed appends: the file is written every save_every steps
+            # and gzip saved little on float32 samples (caskade > 1.1.5)
+            model.save_state(str(path), appendable=True, compression=None)
+        else:
+            model.save_state(str(path), appendable=True)
     restore_values(model, single_state)
 
 

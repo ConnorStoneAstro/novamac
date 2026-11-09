@@ -159,17 +159,18 @@ class Novamac:
     # to a gentler anneal.
     plateau_at = (0.8, 0.6, 0.4, 0.2)
     plateau_steps = 1024  # steps at each fixed t inside the anneal; the anneal phase is anneal_steps + plateau_steps * (number of plateaus) long
-    hold_steps = 1024  # at t = 0: HMC at the true posterior; a drift across the saved states means the chain is still settling
+    hold_steps = 1536  # at t = 0: HMC at the true posterior; hold_adapt_chunks of adaptation, then 512 steps of draws
     # The step sizes keep adapting for this many chunks of the hold (the cut at
     # the hold start is a guess) and are then frozen, chain restarts stop, and
     # the states saved from then on (trace "draws_from_step") are the posterior
     # draws: a state-dependent adaptation or restart during collection would
     # break the fixed-kernel stationarity the draws rely on.
-    # 16 chunks = 512 steps: the hold starts from the scene the last ramp
-    # broke and heals it over a few hundred steps; frozen after 4 chunks the
-    # step size was the easy region's and the acceptance collapsed once the
-    # chains reached the stiff posterior.
-    hold_adapt_chunks = 16
+    # 32 chunks = 1024 steps, as long as a plateau: the hold starts from the
+    # scene the last ramp broke and heals it over a few hundred steps; frozen
+    # after 4 chunks the step size was the easy region's and the acceptance
+    # collapsed once the chains reached the stiff posterior, and 16 chunks
+    # still left a drift across the first draws.
+    hold_adapt_chunks = 32
     # The anneal acceptance is inflated by the predictor (each corrector starts
     # from a slightly displaced state, so its proposals tend to go uphill), which
     # lets the step size grow past what plain HMC at t = 0 can use. The step size
