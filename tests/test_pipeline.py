@@ -79,6 +79,11 @@ def test_posterior_run_plots_and_diagnostics(tmp_path, prior_dir, synthetic):
     assert np.any(np.isfinite(trace["gibbs_accept"])), "Gibbs refresh ran"
     assert "prior_offset_value" in trace
     assert "settings" in trace
+    # the one mass / Jacobian refresh happened at the first chunk at or below mass_refresh_t x t_start, before the draws
+    rs = int(trace["mass_refresh_step"])
+    assert 0 < rs < int(trace["draws_from_step"]) and trace["t"][rs] <= Novamac.mass_refresh_t * float(trace["t_start"])
+    assert trace["t"][rs - FAST_SETTINGS["chunk_steps"]] > Novamac.mass_refresh_t * float(trace["t_start"])
+    assert not np.array_equal(trace["jj_diag"], trace["jj_diag_setup"]) and np.all(np.isfinite(trace["inv_mass0"]))
     # the draw phase: kernels fixed after hold_adapt_chunks chunks of the hold, no restarts after that
     s = FAST_SETTINGS
     hold_start = s["warmup_steps"] + s["anneal_steps"]

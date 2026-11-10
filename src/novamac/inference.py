@@ -46,8 +46,10 @@ Schedule (see hmc.py for the method)
 
 Mass matrix: fixed in shape, inv_mass(t) = inv_mass0 + mass_sigma_fraction *
 sigma(t)^2 on the scene, with inv_mass0 a Gauss-Newton estimate of the t = 0
-posterior variance made once at setup. Nothing about it is learned from the
-chain. The step size is adapted per chain every chunk_steps (x0.7 / x1.2,
+posterior variance made at setup (analytic on the scene, jacobian.py; probed
+on the other blocks) and refreshed once, at mass_refresh_t x t_start, from
+the chains' denoised scene together with the Jacobian diagonal of the
+likelihood broadening. Nothing else about it is learned from the chain. The step size is adapted per chain every chunk_steps (x0.7 / x1.2,
 faster during warmup) and is the one thing to watch: a collapsing step size
 means some direction is badly preconditioned or the target is misbehaving.
 
@@ -71,14 +73,12 @@ import numpy as np
 
 from . import _backend
 from ._backend import DTYPE
-from .align import refine_alignment
 from .build_likelihood import build_likelihood
 from .build_prior import build_prior, training_floor
 from .hmc import (
     SCORE_FIELDS,
     adapt_step_size,
     block_indices,
-    hutchinson_jj_diag,
     make_block_curvature_fn,
     make_broadening_fn,
     make_chunk_runner,
@@ -97,16 +97,14 @@ from .hmc import (
     release_inverse_mass,
 )
 from .host_prior import Prior, load_prior
+from .jacobian import SceneJacobian
 from .init_scene import (
     aperture_fluxes,
     border_sky,
     cd_arcsec,
     data_pixel_scale,
     difference_fluxes,
-    moffat_fwhm,
     prepare_initial_scene,
-    source_pixel_position,
-    stack_templates,
 )
 from .psf import fit_moffat_psfs
 from .products import RunFiles
@@ -224,7 +222,12 @@ class Novamac:
     # broadening makes the actual target somewhat narrower, which only costs a
     # smaller step size while sigma_t is large.
     mass_sigma_fraction = 0.5
-    gn_stride = 8  # scene probe stride for the setup Gauss-Newton estimate (stride^2 probes)
+    # One refresh of inv_mass0's scene part and of diag(JJ^T) (the likelihood
+    # broadening) from the chains' mean squared denoised scene, when t first
+    # reaches mass_refresh_t x t_start (None: never). The setup values describe
+    # the initial stack; by then the chains have found the host. One refresh
+    # shared by the chains on purpose: per-chain updates every chunk were unstable.
+    mass_refresh_t = 0.5
 
     # Diffusion time at which each parameter block is released (frozen at its
     # initial value while t is above this). The scene is always free. While the
@@ -382,9 +385,6 @@ class Novamac:
     # where gradients are large, so it starts tiny and must catch up quickly
     step_down_warmup, step_up_warmup = 0.1, 1.8
 
-    hutchinson_probes = 256  # for diag(J J^T); relative error ~ sqrt(2 / probes)
-    hutchinson_batch = 32
-
     # Test modes.
     # likelihood=False: the likelihood is replaced by 0, every non-scene block
     # stays frozen, and a reference draw from the prior's probability-flow
@@ -448,20 +448,6 @@ class Novamac:
     init_psf_match = 1.1
     init_fit_fwhm = 1.0
     init_aperture_fwhm = 1.5
-    # Initial alignment (align.py): once the initial scene and fluxes exist,
-    # each image's crtan takes init_align_steps Adam steps of init_align_rate
-    # data pixels on its chi-square, clipped to +-init_align_max_shift data
-    # pixels of the input WCS, and keeps the shift only if its chi-square
-    # decreased by at least init_align_min_dchi2 (6: a 95% improvement for two
-    # offsets, so noise is not chased); the initial scene is then stacked
-    # again with the refined offsets. Removes gross misalignment only: the
-    # alignment prior stays centred on the input WCS and the sampler finds
-    # the rest.
-    init_align = True
-    init_align_steps = 100
-    init_align_rate = 0.05
-    init_align_max_shift = 0.1
-    init_align_min_dchi2 = 6.0
 
     # Prior configuration (build_prior). prior_scene_factor: the host prior is
     # shown the scene this many times brighter than the likelihood renders it
@@ -690,10 +676,6 @@ class Novamac:
 
         self.likelihood_args = None  # built by prepare()
         self.init_info = None
-        self.crtan_init = (
-            None  # the images' starting offsets (the input crtan, refined by init_align)
-        )
-        self.align_info = None
         self.model = None  # built by build_model()
         self.trace = None  # the last sample() call's trace
 
@@ -751,7 +733,6 @@ class Novamac:
         if self.sky is None:
             self.sky = np.zeros(self.n_images) if self._border is None else self._border / area
         self._sky_px = self.sky * area
-        self.crtan_init = self.crtan.copy()
         scene, info = self._initial_scene(self.crtan)
         self.init_info = info
         self.likelihood_args = {
@@ -779,8 +760,7 @@ class Novamac:
     def build_model(self):
         """The AstroPhot model (likelihood + prior), built once and cached.
         Every plot and diagnostic uses the same build, so the parameter
-        layout matches the chain files. Estimates the initial fluxes and
-        refines the initial alignment (init_align) on the way when asked."""
+        layout matches the chain files. Estimates the initial fluxes on the way."""
         if self.model is not None:
             return self.model
         self.prepare()
@@ -795,30 +775,6 @@ class Novamac:
             for p in range(self.n_sources):
                 model.models[f"ps_batch_model_{p}"].model.flux.allflux.value = self.ps_flux[p]
             model.meta.ps_flux0 = self.ps_flux
-        if self.init_align and self.likelihood and self.init_image is None:
-            # the raw stack is image-like (PSF-blurred): compare it to the data directly,
-            # outside the transient's aperture, not through the forward model
-            self.align_info = refine_alignment(
-                self._leave_one_out_stacks(self.crtan), self.data, self.weight, self.mask | self._transient_aperture(),
-                self.crpix, self.crtan, self.CD,
-                self.ps_center[0], self.scene_pixel_scale, sky=self._sky_px,
-                max_shift=self.init_align_max_shift, steps=self.init_align_steps, rate=self.init_align_rate,
-                pixel_scale=self.data_pixel_scale, min_dchi2=self.init_align_min_dchi2,
-            )  # fmt: skip
-            self.init_info["report"].extend(self.align_info["report"])
-            if self.align_info["accepted"].any():
-                self.crtan_init = self.align_info["crtan"]
-                for n, target in enumerate(model.target.images):
-                    target.crtan.value = self.crtan_init[n]
-                # the stack again, with the refined offsets (sharper where the input WCS was off)
-                scene, info = self._initial_scene(self.crtan_init)
-                self.likelihood_args["pix_init"] = scene
-                info["report"] = self.init_info["report"] + [
-                    "restacked with the refined alignment: " + info["report"][0]
-                ]
-                self.init_info = info
-                model.models.pixelated_batch_model.model.I.value = scene / self.scene_scale0
-            # the alignment prior stays centred on the input WCS (model.meta.crtan0): only the start moved
         widths = dict(self.prior_widths)
         if widths.get("wcs") is None:
             widths["wcs"] = self.data_pixel_scale
@@ -827,41 +783,6 @@ class Novamac:
             **{f"{k}_prior_width": v for k, v in widths.items()},
         )  # fmt: skip
         return self.model
-
-    def _leave_one_out_stacks(self, crtan):
-        """(N, H, W) raw stacks for the alignment: for each template the stack
-        of the other templates (its own noise must not be in the scene it is
-        compared with), for each transient epoch the stack of all templates;
-        every image when there are too few templates (init_min_templates)."""
-        templates = np.where(self.is_template)[0]
-        full = self.init_info["raw"]
-        if len(templates) < max(self.init_min_templates, 2):
-            return np.broadcast_to(full, (self.n_images,) + full.shape)
-        out = np.empty((self.n_images,) + full.shape)
-        for n in range(self.n_images):
-            if not self.is_template[n]:
-                out[n] = full
-                continue
-            others = self.is_template.copy()
-            others[n] = False
-            out[n] = stack_templates(
-                self.data, self.weight, self.mask, others, self.crpix, crtan, self.CD, self.scene_shape, self.scene_pixel_scale,
-                self.ps_center[0], self._sky_px, min_templates=1, subsample=self.init_subsample,
-            )[0]  # fmt: skip
-        return out
-
-    def _transient_aperture(self):
-        """(N, H, W) pixels within 2 FWHM (at least 3 px) of a point source in
-        the transient epochs: left out of the initial alignment."""
-        N, H, W = self.data.shape
-        rows, cols = np.mgrid[:H, :W]
-        out = np.zeros((N, H, W), dtype=bool)
-        for p in range(self.n_sources):
-            pos = source_pixel_position(self.crpix, self.crtan, self.CD, self.ps_center[p])
-            for n in np.where(~self.is_template)[0]:
-                r = max(2.0 * float(moffat_fwhm(self.psf_n[n], self.psf_Rd[n])), 3.0)
-                out[n] |= (cols - pos[n, 0]) ** 2 + (rows - pos[n, 1]) ** 2 <= r**2
-        return out
 
     def _estimate_fluxes(self, model):
         """The initial point-source fluxes per source and image (see
@@ -904,7 +825,7 @@ class Novamac:
         sn = ~self.is_template
         for p in range(self.n_sources):
             flux, err, _ = difference_fluxes(
-                self.data, self.weight, self.mask, self.is_template, self.crpix, self.crtan_init, self.CD, self.init_info["raw"],
+                self.data, self.weight, self.mask, self.is_template, self.crpix, self.crtan, self.CD, self.init_info["raw"],
                 self.scene_pixel_scale, self.ps_center[0], self.ps_center[p], self._sky_px, self.psf_n, self.psf_Rd, mjd=self.mjd,
                 radius_factor=self.init_fit_fwhm, match_factor=self.init_psf_match,
             )  # fmt: skip
@@ -1183,17 +1104,24 @@ class Novamac:
                 when += f" if the curvature criterion holds, by t <= {b.t_latest:.3g} regardless"
             log(f"  {b.name:11s} {len(b.idx):5d} coords, released at {when}")
 
-        # Jacobian diagonal for the likelihood broadening, once, at the initial scene
+        # Jacobian diagonals (analytic, jacobian.SceneJacobian) at the initial
+        # scene: diag(JJ^T) for the likelihood broadening and the scene's
+        # Gauss-Newton curvature for the mass matrix (both refreshed once at
+        # mass_refresh_t x t_start below)
         # ----------------------------------------------------------------
-        rng, key = jax.random.split(rng)
+        jac, scene_curvature = None, None
+        scale0 = float(pix.scale.npvalue)
         if no_likelihood:
             jj = jnp.zeros(int(np.prod(self.data.shape)), dtype=DTYPE)
         else:
-            with Timer("Jacobian diagonal (Hutchinson, includes compile)", timings):
-                jj = hutchinson_jj_diag(
-                    images, x0, scene_idx, key, self.hutchinson_probes, self.hutchinson_batch
-                )
-                jax.block_until_ready(jj)
+            with Timer("Jacobian diagonals (analytic, includes compile)", timings):
+                jac = SceneJacobian(
+                    self.crpix, self.crtan, self.CD, self.ps_center[0], self.scene_pixel_scale, pix.I.shape, self.data.shape[1:],
+                    self.weight, self.mask, self.psf_n, self.psf_Rd, self.psf_q, self.psf_PA, self.psf_shape, sub=self.psf_upsample,
+                )  # fmt: skip
+                I0_sq = np.exp(2.0 * np.asarray(x0, dtype=np.float64)[scene_idx]).reshape(pix.I.shape)
+                scene_curvature = jac.curvature(I0_sq, scale0).ravel()
+                jj = jac.jj_diag(I0_sq, scale0)
         jj_np = np.asarray(jj)
         if not np.all(np.isfinite(jj_np)):
             raise RuntimeError(f"{self.name}: non-finite Jacobian diagonal")
@@ -1207,7 +1135,7 @@ class Novamac:
         # Mass matrix, once: Gauss-Newton t = 0 variance estimate
         # ----------------------------------------------------------------
         with Timer("Gauss-Newton mass matrix (includes compile)", timings):
-            inv_mass0, reference_var, flat, gn_curv = setup_inverse_mass(
+            inv_mass0, reference_var, flat, gn_curv, precision = setup_inverse_mass(
                 model,
                 images,
                 x0,
@@ -1215,7 +1143,7 @@ class Novamac:
                 blocks,
                 self.weight,
                 self.mask,
-                self.gn_stride,
+                scene_curvature=scene_curvature,
                 likelihood=not no_likelihood,
             )
         gibbs_fn, lin = None, None
@@ -1240,6 +1168,10 @@ class Novamac:
             log(
                 f"{int(np.sum(flat))} coordinates have neither likelihood nor prior curvature and stay frozen"
             )
+        log(
+            f"scene curvature (analytic Gauss-Newton in log I): max {np.max(gn_curv[scene_idx]):.3g}, "
+            f"median {np.median(gn_curv[scene_idx]):.3g} vs prior precision {np.max(precision[scene_idx]):.3g}"
+        )
         log(
             f"inv_mass0 (t=0 variance estimate): scene median {np.median(inv_mass0[scene_idx]):.3g} "
             f"(prior sigma_min^2 = {float(sde.sigma_min) ** 2:.3g}); mass at the start adds "
@@ -1322,7 +1254,10 @@ class Novamac:
             "scene_idx": scene_idx,
             "scene_shape": np.array(pix.I.shape),
             **{f"block_idx_{b.name}": b.idx for b in blocks},
-            "inv_mass0": inv_mass0.astype(np.float32),
+            "inv_mass0": inv_mass0.astype(np.float32),  # the refresh overwrites this and jj_diag (the setup values stay under *_setup)
+            "inv_mass0_setup": inv_mass0.astype(np.float32),
+            "jj_diag_setup": jj_np.astype(np.float32),
+            "mass_refresh_step": -1,
             **({"pflow_reference": pflow_reference.astype(np.float32)} if pflow_reference is not None else {}),
             "gauss_newton_curvature": gn_curv.astype(np.float32),
             "jj_diag": jj_np.astype(np.float32),
@@ -1399,27 +1334,17 @@ class Novamac:
             positions = positions.at[:, scene_dev_idx].set(
                 jnp.clip(noised, -self.max_abs_log_scene, self.max_abs_log_scene)
             )
-            # the likelihood the chains see at t_start: through the target's
-            # Tweedie map (the raw likelihood of the noised scene overflows
-            # exp() once pixels sit on the box, which the target never
-            # evaluates for t > 0)
-            start_target = target if self._likelihood_on(0, t_start) else target_off
-            ll, lp = (float(v) for v in start_target.parts(positions[0], t_start, broaden_fn(t_start) * jj)[:2])
             log(
                 f"scene start = initial scene + N(0, {s0:.3g}^2) in log I per chain"
                 + (f" ({n_clipped} of {C * len(scene_idx)} pixels clipped to |log I| <= {self.max_abs_log_scene:g})" if n_clipped else "")
-                + f"; chain 0 at t={t_start:.3g}: log likelihood {ll:.6g}, log prior {lp:.6g}"
             )
-            if not (np.isfinite(ll) and np.isfinite(lp)):
-                raise RuntimeError(
-                    f"{self.name}: non-finite log density at the noised starting point"
-                )
         jj_dev = as_dev(jj)
         inv_mass0_dev = as_dev(inv_mass0)
         scene_mask_dev = as_dev(scene_mask)
         inv_mass_at = (
             lambda t: inv_mass0 + self.mass_sigma_fraction * float(sigma_fn(t)) ** 2 * scene_mask
         )  # noqa: E731
+        refresh_t = None if not self.mass_refresh_t else float(self.mass_refresh_t) * t_start
         runners = {}
         # runners are cached by (chunk length, likelihood on, non-scene step on,
         # predictor-only chunk, constant-t chunk): a constant-t chunk (hold,
@@ -1482,7 +1407,7 @@ class Novamac:
 
         with Timer("initial step size search (includes compile)", timings):
             runners[(1, lik_on, nuis_on, False, False)] = make_runner(1, lik_on, nuis_on, False)
-            rng, step_size, step_size_nuis = find_initial_step_size(
+            rng, step_size, step_size_nuis, first_trace = find_initial_step_size(
                 runners[(1, lik_on, nuis_on, False, False)],
                 rng,
                 positions,
@@ -1494,6 +1419,20 @@ class Novamac:
                 as_dev,
                 initial_step_size=self.initial_step_size,
                 tune_nuis=nuis_on,
+            )
+        # The starting point's log density, from the search's first trial step
+        # rather than a separate (separately compiled) evaluation: the density
+        # the runner logs is the state after that step, which is the start
+        # itself where the trial was rejected and an accepted step's end
+        # otherwise. A non-finite start shows either as a non-finite logged
+        # density or as log alpha = +inf (the kernel's recovery branch, which
+        # takes the first finite proposal); no valid state has either.
+        ll0, lp0 = (float(np.asarray(first_trace[k])[0, 0]) for k in ("loglik", "logprior"))
+        log(f"chain 0 after the first trial step at t={t_start:.3g}: log likelihood {ll0:.6g}, log prior {lp0:.6g}")
+        bad_start = ~np.isfinite(np.asarray(first_trace["logdensity"])[:, 0]) | np.isposinf(np.asarray(first_trace["log_alpha"])[:, 0])
+        if np.any(bad_start):
+            raise RuntimeError(
+                f"{self.name}: non-finite log density at the starting point of chains {np.where(bad_start)[0].tolist()}"
             )
         if C > 1:
             # the chains start statistically alike, so one chain's search landing
@@ -1517,6 +1456,13 @@ class Novamac:
             in_axes=(0, None),
         ))  # fmt: skip
         scene_hat = []
+
+        def denoised_intensity(x, t):
+            """exp of the scene the likelihood sees at t (Target.denoise), per chain (C, Hs, Ws)."""
+            I = tweedie_fn(x, t) if tweedie else jnp.exp(x[:, scene_dev_idx]).reshape((C,) + tuple(pix.I.shape))
+            if log_var_fn is not None:
+                I = I * jnp.exp(-0.5 * log_var_fn(t))
+            return np.asarray(I, dtype=np.float64)
 
         def save_tweedie(t):
             scene_hat.append(np.asarray(tweedie_fn(positions, float(t)), dtype=np.float32))
@@ -1653,6 +1599,34 @@ class Novamac:
                     log(f"released {b.name} at step {s0} (t={ts[s0]:.3f}, {why}): {summary}; {cut}")
                 else:
                     log(f"probed {b.name} at step {s0} (t={ts[s0]:.3f}), stays frozen: {summary}")
+
+            # One refresh of the mass matrix's scene part and of the Jacobian
+            # diagonal from the chains' current denoised scene (mass_refresh_t)
+            if (
+                jac is not None and refresh_t is not None and trace["mass_refresh_step"] < 0
+                and float(ts[s0]) <= refresh_t and s0 < draws_from
+            ):  # fmt: skip
+                with Timer("mass / Jacobian refresh", timings):
+                    I_sq = np.mean(denoised_intensity(positions, float(ts[s0])) ** 2, axis=0)
+                    curv_new = jac.curvature(I_sq, scale0).ravel()
+                    jj_new = jac.jj_diag(I_sq, scale0)
+                if not (np.all(np.isfinite(curv_new)) and np.all(np.isfinite(jj_new))):
+                    log(f"WARNING: non-finite Jacobian terms at step {s0}; the setup mass matrix and Jacobian diagonal are kept")
+                else:
+                    scene_old = inv_mass0[scene_idx]
+                    inv_mass0 = inv_mass0.copy()
+                    inv_mass0[scene_idx] = 1.0 / (np.maximum(curv_new, 0.0) + precision[scene_idx])
+                    inv_mass0_dev = as_dev(inv_mass0)
+                    jj_dev = as_dev(jj_new)
+                    trace["inv_mass0"], trace["jj_diag"] = inv_mass0.astype(np.float32), jj_new.astype(np.float32)
+                    log(
+                        f"mass matrix and Jacobian diagonal refreshed at step {s0} (t={ts[s0]:.3f}) from the chains' mean squared "
+                        f"denoised scene: scene curvature max {np.max(gn_curv[scene_idx]):.3g} -> {np.max(curv_new):.3g} "
+                        f"(prior precision {np.max(precision[scene_idx]):.3g}), scene inv_mass0 median {np.median(scene_old):.3g} -> "
+                        f"{np.median(inv_mass0[scene_idx]):.3g}; diag(JJ^T) median {np.median(jj_np):.3g} -> {np.median(jj_new):.3g}, "
+                        f"max {np.max(jj_np):.3g} -> {np.max(jj_new):.3g}"
+                    )
+                trace["mass_refresh_step"] = s0
 
             pred_only = bool(pred_chunks[ci])  # a predictor-only ramp chunk
             const_t = (not pred_only) and bool(np.all(ts_prev[s0:s1] == ts[s0:s1]))  # the target does not move: hold, plateau

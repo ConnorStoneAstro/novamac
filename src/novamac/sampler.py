@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._backend import DTYPE
-from .hmc import block_indices, flat_index, make_gauss_newton_fn, sampler_sde, strided_pixel_groups
+from .hmc import block_indices, flat_index, make_gauss_newton_fn, sampler_sde
 from .utils import log
 
 
@@ -199,7 +199,7 @@ def calibrate_prior_offset(model, scene_log, rng_key, n_sigmas=64):
     values = np.array([float(prior.energy(scene + float(sg) * z, float(sg))) / n_pix for sg in sigmas])
     s0 = float(sigmas[0])
     mult = (float(prior.energy(scene + s0 * z, s0, 0.0)) - float(prior.energy(scene + s0 * z, s0, 1.0))) / n_pix
-    if not np.isfinite(mult) or abs(mult - round(mult)) > 1e-3 or mult < 1:
+    if not np.isfinite(mult) or abs(mult - round(mult)) > 1e-3 or round(mult) < 1:
         raise RuntimeError(f"the prior's pixel_offset multiplicity measured as {mult:.6g}, not a positive integer")
     mult = float(round(mult))
     model.meta.prior_offset_multiplicity = mult
@@ -339,28 +339,31 @@ def prior_precision(model, weight, mask):
     return precision, reference, template_flux
 
 
-def setup_inverse_mass(model, images, x0, scene_idx, blocks, weight, mask, gn_stride, likelihood=True):
+def setup_inverse_mass(model, images, x0, scene_idx, blocks, weight, mask, scene_curvature=None, likelihood=True):
     """
     inv_mass0: Gauss-Newton estimate of the t = 0 posterior variance per
     coordinate, 1 / (diag(J^T W J) + prior precision), evaluated once at the
-    initial state. The scene is probed with a stride pattern, the blocks with
-    their groups. Coordinates with neither likelihood nor prior curvature
-    (template-image fluxes) are reported and frozen by the caller.
-    Returns (inv_mass0, reference variance, flat mask, curvature).
+    initial state. The scene's curvature is given (`scene_curvature`, one
+    value per scene coordinate: the analytic jacobian.SceneJacobian term),
+    the blocks are probed with their groups. Coordinates with neither
+    likelihood nor prior curvature (template-image fluxes) are reported and
+    frozen by the caller.
+    Returns (inv_mass0, reference variance, flat mask, curvature, prior precision).
     """
-    pix = model.models.pixelated_batch_model.model
-    groups = strided_pixel_groups(scene_idx, pix.I.shape, gn_stride) + [g for b in blocks for g in b.groups]
+    groups = [g for b in blocks for g in b.groups]
     idx = np.concatenate(groups)
     curvature = np.zeros(x0.shape[0])
     if likelihood:  # no likelihood, no likelihood curvature (and no inf * 0 from an overflowing start)
         _, w = flat_data_weight(model)  # weights in exactly the order log_likelihood / images flatten the data
         gauss_newton = make_gauss_newton_fn(images, groups)
         curvature[idx] = np.nan_to_num(np.asarray(gauss_newton(x0, jnp.asarray(w, DTYPE)), dtype=np.float64))
+        if scene_curvature is not None:
+            curvature[scene_idx] = np.nan_to_num(np.asarray(scene_curvature, dtype=np.float64))
     precision, reference, template_flux = prior_precision(model, weight, mask)
     total = np.maximum(curvature, 0.0) + precision
     flat = total <= 0
     inv_mass0 = np.where(flat, 1.0, 1.0 / np.where(flat, 1.0, total))
-    return inv_mass0, reference, flat | template_flux, curvature
+    return inv_mass0, reference, flat | template_flux, curvature, precision
 
 
 # Initial step size
@@ -372,7 +375,9 @@ def find_initial_step_size(runner_1step, rng, positions, inv_mass0, t, jj, t_rel
     are accepted with probability above (below) 0.5, stop at the first
     crossing. Per chain. With tune_nuis the non-scene sub-step's step size
     is searched at the same time from its own acceptance. Returns
-    (rng, step_size, step_size_nuis).
+    (rng, step_size, step_size_nuis, first_trace), the last the runner's
+    trace of the first trial step from the starting point (the caller's
+    start diagnostic).
     """
     num_chains = positions.shape[0]
     keys = ("accept_prob", "accept_prob_nuis") if tune_nuis else ("accept_prob",)
@@ -381,12 +386,15 @@ def find_initial_step_size(runner_1step, rng, positions, inv_mass0, t, jj, t_rel
     done = {k: np.zeros(num_chains, dtype=bool) for k in keys}
     ts = as_dev(np.array([t]))
     nuis = lambda: step.get("accept_prob_nuis", step["accept_prob"])  # noqa: E731
+    first_trace = None
     for _ in range(max_rounds):
         rng, key = jax.random.split(rng)
         _, ctrace = runner_1step(
             jax.random.split(key, num_chains), positions, as_dev(step["accept_prob"]), as_dev(nuis()), as_dev(inv_mass0),
             ts, ts, jj, as_dev(t_release), as_dev(scene_mask),
         )  # fmt: skip
+        if first_trace is None:
+            first_trace = ctrace
         for k in keys:
             acc = np.asarray(ctrace[k])[:, 0]
             new_direction = np.where(acc > 0.5, 1.0, -1.0)
@@ -395,7 +403,7 @@ def find_initial_step_size(runner_1step, rng, positions, inv_mass0, t, jj, t_rel
             step[k] = np.where(done[k], step[k], step[k] * np.where(direction[k] > 0, 2.0, 0.5))
         if all(np.all(d) for d in done.values()):
             break
-    return rng, step["accept_prob"], nuis()
+    return rng, step["accept_prob"], nuis(), first_trace
 
 
 # Disk output helpers
